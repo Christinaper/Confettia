@@ -37,10 +37,35 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))    # 用户冷却秒
 COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))     # 冷却窗口内最大次数
 GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))    # 全局每分钟最大请求数
 
-# 独聊频道：这些频道里无需 @，Bot 响应所有消息，回复不 quote
-# .env 里填：SOLO_CHANNEL_IDS=123456789,987654321（逗号分隔多个）
-_solo_raw = os.getenv("SOLO_CHANNEL_IDS", "")
-SOLO_CHANNEL_IDS: set[str] = {s.strip() for s in _solo_raw.split(",") if s.strip()}
+# ── 频道角色配置 ─────────────────────────────────────────────────────────────
+# .env 里按角色分别填频道 ID（逗号分隔）：
+#   CHAT_CHANNELS=111,222     独聊频道：无需 @，无 quote，自由对话
+#   RSS_CHANNELS=333          推送频道：只收推送，不响应用户消息
+#   LOG_CHANNELS=444          日志频道：Bot 写状态日志，不响应消息
+#   TOPIC_CHANNELS=555        话题频道：检测 URL 自动展开总结
+#
+# 不在任何角色里的频道：必须 @，正常响应
+
+def _parse_channels(env_key: str) -> set[str]:
+    raw = os.getenv(env_key, "")
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+CHAT_CHANNELS  = _parse_channels("CHAT_CHANNELS")
+RSS_CHANNELS   = _parse_channels("RSS_CHANNELS")
+LOG_CHANNELS   = _parse_channels("LOG_CHANNELS")
+TOPIC_CHANNELS = _parse_channels("TOPIC_CHANNELS")
+
+# 兼容旧配置：SOLO_CHANNEL_IDS 等同于 CHAT_CHANNELS
+_legacy = _parse_channels("SOLO_CHANNEL_IDS")
+CHAT_CHANNELS |= _legacy
+
+def get_channel_role(chan_id: str) -> str:
+    """返回频道角色，默认 'mention'（需要 @ 才响应）。"""
+    if chan_id in CHAT_CHANNELS:  return "chat"
+    if chan_id in RSS_CHANNELS:   return "rss"
+    if chan_id in LOG_CHANNELS:   return "log"
+    if chan_id in TOPIC_CHANNELS: return "topic"
+    return "mention"
 
 # ── Bot 初始化 ────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -180,8 +205,8 @@ async def health_check():
         _processing.clear()
     usage = get_usage_summary()
     log.info(
-        f"💓 健康检查 | Token: {usage['total']}/{usage['budget']} "
-        f"({usage['pct']}%) | 调用: {usage['calls']}次 | 队列: {len(_processing)}"
+        f"💓 健康检查｜Token：{usage['total']}/{usage['budget']} "
+        f"({usage['pct']}%)｜调用：{usage['calls']}次｜队列：{len(_processing)}"
     )
 
 @health_check.before_loop
@@ -194,59 +219,89 @@ async def before_health():
 async def on_message(message: discord.Message):
     global _error_count
 
-    # [安全 1] 严禁响应任何 Bot 消息（防止 Bot↔Bot 死循环）
+    # [安全] Bot 消息一律忽略（防死循环）
     if message.author.bot:
         return
 
-    user_id  = str(message.author.id)
     chan_id  = str(message.channel.id)
+    user_id  = str(message.author.id)
+    role     = get_channel_role(chan_id)
+    mentioned = bot.user in message.mentions
 
-    # [安全 2] 触发判断：
-    #   - 独聊频道（SOLO_CHANNEL_IDS）：任何消息都响应，无需 @
-    #   - 其他频道：必须 @ Bot
-    in_solo_channel = chan_id in SOLO_CHANNEL_IDS
-    mentioned       = bot.user in message.mentions
+    # ── 按频道角色路由 ────────────────────────────────────────────────────────
 
-    if not in_solo_channel and not mentioned:
+    # RSS / LOG 频道：只接收 Bot 写入，用户消息一律忽略
+    if role in ("rss", "log"):
+        return
+
+    # TOPIC 频道：检测 URL，自动展开总结（需 @ 或含 URL）
+    if role == "topic":
+        has_url = "http://" in message.content or "https://" in message.content
+        if not has_url and not mentioned:
+            return
+        await _handle_topic(message, user_id, chan_id)
+        return
+
+    # CHAT 频道：无需 @，直接对话
+    if role == "chat":
+        await _handle_chat(message, user_id, chan_id, quote=False)
+        return
+
+    # 默认（mention）：必须 @
+    if not mentioned:
         await bot.process_commands(message)
         return
+    await _handle_chat(message, user_id, chan_id, quote=True)
+    await bot.process_commands(message)
 
+
+def _token_usage_error():
+    try:
+        from tools.llm import _token_usage
+        _token_usage["errors"] += 1
+    except Exception:
+        pass
+
+
+# ── 核心对话处理 ──────────────────────────────────────────────────────────────
+async def _handle_chat(
+    message: discord.Message,
+    user_id: str,
+    chan_id: str,
+    quote: bool,
+):
+    """chat / mention 频道的通用对话处理。"""
     lock_key = f"{user_id}:{chan_id}"
 
-    # [安全 3] 日预算熔断
+    # [安全] 日预算熔断
     if is_budget_exceeded():
-        await _send(message, "🔴 **今日 API 预算已达上限**, UTC 00:00 (北京时间 08:00)自动重置。")
+        await _send(message, "🔴 **今日预算已达上限**，UTC 00:00 自动重置。")
         return
 
-    # [安全 4] 全局 RPM 限制
+    # [安全] 全局 RPM 限制
     if not _check_global_rpm():
         await message.add_reaction("🚫")
         return
 
-    # [安全 5] 用户冷却
+    # [安全] 用户冷却
     allowed, wait_sec = _check_user_cooldown(user_id)
     if not allowed:
-        await _send(
-            message,
-            f"⏳ 请求过于频繁，请 **{wait_sec}s** 后再试。",
-            delete_after=8,
-        )
+        await _send(message, f"⏳ 请 **{wait_sec}s** 后再试。", delete_after=8)
         return
 
-    # [安全 6] 并发锁
+    # [安全] 并发锁
     if lock_key in _processing:
         await message.add_reaction("⏳")
         return
 
-    # 清洗输入：独聊频道直接用全文，其他频道去掉 @ 标签
+    # 清洗输入：not quote频道去掉 @ 标签
     raw_input = (
         message.content
-        if in_solo_channel
+        if not quote                                          # chat 频道：全文
         else message.content.replace(f"<@{bot.user.id}>", "").strip()
     )
-
-    if not raw_input:
-        return  # 独聊频道收到空消息（如纯表情）静默忽略
+    if not raw:
+        return  # 收到空消息（如纯表情）静默忽略
 
     was_truncated, user_input = _sanitize_input(raw_input)
 
@@ -258,41 +313,72 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             response = await asyncio.wait_for(
                 run_agent(user_id, chan_id, user_input),
-                timeout=45.0,   # 搜索场景适当放宽
+                timeout=45.0,
             )
-
+        global _error_count
         _error_count = 0
 
         # 如果输入被截断，在回复前加提示
         if was_truncated:
-            response = f"> ⚠️ 消息超过 {MAX_INPUT_LEN} 字符，已截取前段处理。\n\n" + response
-
-        await send_long_message(message, response, quote=not in_solo_channel)
+            response = f"> ⚠️ 消息超过 {MAX_INPUT_LEN} 字符，已截取前段。\n\n" + response
+        await send_long_message(message, response, quote=quote)
 
     except asyncio.TimeoutError:
-        elapsed = 45
-        log.warning(f"请求超时 {elapsed}s：uid={user_id} input='{user_input[:50]}'")
-        await _send(message, "⏱️ 响应超时，可能是搜索较慢，请稍后重试。")
+        log.warning(f"超时 45s：uid={user_id} input='{user_input[:50]}'")
+        await _send(message, "⏱️ 响应超时，搜索较慢时可能发生，请稍后重试。")
     except Exception as e:
         _error_count += 1
         _token_usage_error()
-        log.error(f"处理失败（{_error_count}/{MAX_ERRORS}）：{e}", exc_info=True)
+        log.error(f"对话失败（{_error_count}/{MAX_ERRORS}）：{e}", exc_info=True)
         await _send(message, "❌ 处理出错，请稍后重试。")
         if _error_count >= MAX_ERRORS:
             await _recovery()
     finally:
         _processing.discard(lock_key)
 
-    await bot.process_commands(message)
 
+# ── Topic 频道：URL 自动展开 ──────────────────────────────────────────────────
+async def _handle_topic(message: discord.Message, user_id: str, chan_id: str):
+    """
+    检测消息里的 URL，抓取页面标题 + 摘要，
+    让 LLM 总结并提出 3 个延伸问题。
+    """
+    import re
+    urls = re.findall(r"https?://\S+", message.content)
+    user_text = re.sub(r"https?://\S+", "", message.content).strip()
+    user_text = user_text.replace(f"<@{bot.user.id}>", "").strip()
 
-def _token_usage_error():
-    """记录错误到 llm 模块的计数器。"""
+    if not urls:
+        # 没有 URL 但有 @，当普通对话处理
+        await _handle_chat(message, user_id, chan_id, quote=True)
+        return
+
+    url = urls[0]   # 只处理第一个 URL
+    prompt = (
+        f"请帮我总结以下链接的内容，并提出 3 个值得深入思考的延伸问题。\n\n"
+        f"链接：{url}\n"
+        + (f"用户补充：{user_text}" if user_text else "")
+    )
+
+    lock_key = f"{user_id}:{chan_id}"
+    if lock_key in _processing:
+        await message.add_reaction("⏳")
+        return
+
+    _processing.add(lock_key)
     try:
-        from tools.llm import _token_usage
-        _token_usage["errors"] += 1
-    except Exception:
-        pass
+        async with message.channel.typing():
+            response = await asyncio.wait_for(
+                run_agent(user_id, chan_id, prompt, force_search=False),
+                timeout=45.0,
+            )
+        await send_long_message(message, response, quote=False)
+    except asyncio.TimeoutError:
+        await message.channel.send("⏱️ 链接处理超时，请稍后重试。")
+    except Exception as e:
+        log.error(f"topic 处理失败：{e}", exc_info=True)
+    finally:
+        _processing.discard(lock_key)
 
 
 # ── Slash：/search ────────────────────────────────────────────────────────────
@@ -374,7 +460,7 @@ async def slash_reload(interaction: discord.Interaction):
 
 # ── Slash：/digest（手动触发推送，仅 Bot 主人）────────────────────────────────
 @bot.tree.command(name="digest", description="📡 立即拉取 RSS 并推送到指定频道（仅主人）")
-@app_commands.describe(mode="rss=只推 RSS 新内容, daily=完整早报")
+@app_commands.describe(mode="rss=只推 RSS 新内容，daily=完整早报")
 @app_commands.choices(mode=[
     app_commands.Choice(name="RSS 新内容", value="rss"),
     app_commands.Choice(name="每日早报",   value="daily"),
@@ -431,7 +517,7 @@ async def slash_status(interaction: discord.Interaction):
         f"调用次数    : {u['calls']} 次\n"
         f"错误次数    : {u['errors']} 次\n"
         f"```\n"
-        f"你的对话记录：`{msg_count}` 条 "
+        f"你的对话记录：`{msg_count}` 条　"
         f"处理队列：`{len(_processing)}` 条",
         ephemeral=True,
     )
@@ -439,12 +525,8 @@ async def slash_status(interaction: discord.Interaction):
 
 # ── 辅助：发送消息（统一处理 quote 逻辑）────────────────────────────────────
 async def _send(message: discord.Message, text: str, delete_after: float = None):
-    """
-    独聊频道用 channel.send，其他频道用 reply。
-    系统提示类消息（限流/错误）统一不 quote，减少视觉干扰。
-    """
-    chan_id = str(message.channel.id)
-    if chan_id in SOLO_CHANNEL_IDS:
+    """chat 频道用 channel.send，其他用 reply。"""
+    if get_channel_role(str(message.channel.id)) == "chat":
         await message.channel.send(text, delete_after=delete_after)
     else:
         await message.reply(text, delete_after=delete_after)
