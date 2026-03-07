@@ -37,6 +37,11 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))    # 用户冷却秒
 COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))     # 冷却窗口内最大次数
 GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))    # 全局每分钟最大请求数
 
+# 独聊频道：这些频道里无需 @，Bot 响应所有消息，回复不 quote
+# .env 里填：SOLO_CHANNEL_IDS=123456789,987654321（逗号分隔多个）
+_solo_raw = os.getenv("SOLO_CHANNEL_IDS", "")
+SOLO_CHANNEL_IDS: set[str] = {s.strip() for s in _solo_raw.split(",") if s.strip()}
+
 # ── Bot 初始化 ────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -193,18 +198,24 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # [安全 2] 只响应 @ 提及
-    if bot.user not in message.mentions:
+    user_id  = str(message.author.id)
+    chan_id  = str(message.channel.id)
+
+    # [安全 2] 触发判断：
+    #   - 独聊频道（SOLO_CHANNEL_IDS）：任何消息都响应，无需 @
+    #   - 其他频道：必须 @ Bot
+    in_solo_channel = chan_id in SOLO_CHANNEL_IDS
+    mentioned       = bot.user in message.mentions
+
+    if not in_solo_channel and not mentioned:
         await bot.process_commands(message)
         return
 
-    user_id  = str(message.author.id)
-    chan_id  = str(message.channel.id)
     lock_key = f"{user_id}:{chan_id}"
 
     # [安全 3] 日预算熔断
     if is_budget_exceeded():
-        await message.reply("🔴 **今日 API 预算已达上限**，UTC 00:00（北京时间 08:00）自动重置。")
+        await _send(message, "🔴 **今日 API 预算已达上限**, UTC 00:00 (北京时间 08:00)自动重置。")
         return
 
     # [安全 4] 全局 RPM 限制
@@ -215,23 +226,27 @@ async def on_message(message: discord.Message):
     # [安全 5] 用户冷却
     allowed, wait_sec = _check_user_cooldown(user_id)
     if not allowed:
-        await message.reply(
-            f"⏳ 请求过于频繁，请 **{wait_sec}s** 后再试。\n"
-            f"（限制：每 {COOLDOWN_SECONDS}s 内最多 {COOLDOWN_MAX} 次）",
-            delete_after=10,  # 10 秒后自动删除提示
+        await _send(
+            message,
+            f"⏳ 请求过于频繁，请 **{wait_sec}s** 后再试。",
+            delete_after=8,
         )
         return
 
-    # [安全 6] 并发锁（同一用户同一频道不能同时处理两个请求）
+    # [安全 6] 并发锁
     if lock_key in _processing:
         await message.add_reaction("⏳")
         return
 
-    # 提取并清洗输入
-    raw_input = message.content.replace(f"<@{bot.user.id}>", "").strip()
+    # 清洗输入：独聊频道直接用全文，其他频道去掉 @ 标签
+    raw_input = (
+        message.content
+        if in_solo_channel
+        else message.content.replace(f"<@{bot.user.id}>", "").strip()
+    )
+
     if not raw_input:
-        await message.reply("你好！有什么我可以帮你查找的吗？")
-        return
+        return  # 独聊频道收到空消息（如纯表情）静默忽略
 
     was_truncated, user_input = _sanitize_input(raw_input)
 
@@ -243,25 +258,26 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             response = await asyncio.wait_for(
                 run_agent(user_id, chan_id, user_input),
-                timeout=30.0,
+                timeout=45.0,   # 搜索场景适当放宽
             )
 
         _error_count = 0
 
         # 如果输入被截断，在回复前加提示
         if was_truncated:
-            response = f"> ⚠️ 你的消息超过 {MAX_INPUT_LEN} 字符，已截取前段处理。\n\n" + response
+            response = f"> ⚠️ 消息超过 {MAX_INPUT_LEN} 字符，已截取前段处理。\n\n" + response
 
-        await send_long_message(message, response)
+        await send_long_message(message, response, quote=not in_solo_channel)
 
     except asyncio.TimeoutError:
-        log.warning(f"请求超时：{user_id}，输入：{user_input[:40]}")
-        await message.reply("⏱️ 请求超时（30s），请稍后重试或缩短问题。")
+        elapsed = 45
+        log.warning(f"请求超时 {elapsed}s：uid={user_id} input='{user_input[:50]}'")
+        await _send(message, "⏱️ 响应超时，可能是搜索较慢，请稍后重试。")
     except Exception as e:
         _error_count += 1
         _token_usage_error()
         log.error(f"处理失败（{_error_count}/{MAX_ERRORS}）：{e}", exc_info=True)
-        await message.reply("❌ 处理出错，请稍后重试。")
+        await _send(message, "❌ 处理出错，请稍后重试。")
         if _error_count >= MAX_ERRORS:
             await _recovery()
     finally:
@@ -421,15 +437,34 @@ async def slash_status(interaction: discord.Interaction):
     )
 
 
-# ── 辅助：长消息分段 ──────────────────────────────────────────────────────────
-async def send_long_message(message: discord.Message, text: str):
+# ── 辅助：发送消息（统一处理 quote 逻辑）────────────────────────────────────
+async def _send(message: discord.Message, text: str, delete_after: float = None):
+    """
+    独聊频道用 channel.send，其他频道用 reply。
+    系统提示类消息（限流/错误）统一不 quote，减少视觉干扰。
+    """
+    chan_id = str(message.channel.id)
+    if chan_id in SOLO_CHANNEL_IDS:
+        await message.channel.send(text, delete_after=delete_after)
+    else:
+        await message.reply(text, delete_after=delete_after)
+
+
+async def send_long_message(message: discord.Message, text: str, quote: bool = True):
+    """
+    quote=False（独聊频道）：直接 channel.send，界面干净
+    quote=True（普通频道）：reply 保持上下文关联
+    """
+    chan_id = str(message.channel.id)
+    send_fn = message.reply if quote else message.channel.send
+
     if len(text) <= 1900:
-        await message.reply(text)
+        await send_fn(text)
         return
     chunks = [text[i:i+1900] for i in range(0, len(text), 1900)]
     for i, chunk in enumerate(chunks):
         if i == 0:
-            await message.reply(chunk)
+            await send_fn(chunk)
         else:
             await message.channel.send(chunk)
 
