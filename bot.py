@@ -303,7 +303,7 @@ async def _handle_chat(
     if not raw:
         return  # 收到空消息（如纯表情）静默忽略
 
-    was_truncated, user_input = _sanitize_input(raw_input)
+    was_truncated, user_input = _sanitize_input(raw)
 
     # 记录本次请求（冷却窗口计入）
     _record_user_request(user_id)
