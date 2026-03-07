@@ -295,7 +295,7 @@ async def _handle_chat(
         return
 
     # 清洗输入：not quote频道去掉 @ 标签
-    raw_input = (
+    raw = (
         message.content
         if not quote                                          # chat 频道：全文
         else message.content.replace(f"<@{bot.user.id}>", "").strip()
