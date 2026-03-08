@@ -1,5 +1,5 @@
 # bot.py
-# 安全版：多层限流 + 输入过滤 + 预算感知状态显示
+# 安全版：多层限流 + 输入过滤 + 预算感知 + 频道角色化
 
 import discord
 from discord.ext import commands, tasks
@@ -14,6 +14,8 @@ from agent import run_agent, memory
 from tools.llm import get_usage_summary, is_budget_exceeded, call_llm
 from tools.prompt_builder import reload_soul
 from tools.scheduler import setup_scheduler, _rss_check_job, _daily_digest_job
+from tools.memo import memo_store, format_weekly_digest
+from tools.review import should_review, build_review_prompt
 
 load_dotenv()
 
@@ -37,34 +39,37 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))    # 用户冷却秒
 COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))     # 冷却窗口内最大次数
 GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))    # 全局每分钟最大请求数
 
-# ── 频道角色配置 ─────────────────────────────────────────────────────────────
-# .env 里按角色分别填频道 ID（逗号分隔）：
-#   CHAT_CHANNELS=111,222     独聊频道：无需 @，无 quote，自由对话
-#   RSS_CHANNELS=333          推送频道：只收推送，不响应用户消息
-#   LOG_CHANNELS=444          日志频道：Bot 写状态日志，不响应消息
-#   TOPIC_CHANNELS=555        话题频道：检测 URL 自动展开总结
-#
-# 不在任何角色里的频道：必须 @，正常响应
+# ── 频道角色配置 ──────────────────────────────────────────────────────────────
+# .env 配置示例 里按角色分别填频道 ID（逗号分隔）：
+#   CHAT_CHANNELS=111       独聊，无需 @，无 quote
+#   RSS_CHANNELS=222        只收推送，忽略用户消息
+#   LOG_CHANNELS=333        Bot 状态日志，忽略用户消息
+#   TOPIC_CHANNELS=444      含 URL 自动展开
+#   MEMO_CHANNELS=555       存储碎片想法，不回复
+#   REVIEW_CHANNELS=666     代码/长文自动点评
 
 def _parse_channels(env_key: str) -> set[str]:
     raw = os.getenv(env_key, "")
     return {s.strip() for s in raw.split(",") if s.strip()}
 
-CHAT_CHANNELS  = _parse_channels("CHAT_CHANNELS")
-RSS_CHANNELS   = _parse_channels("RSS_CHANNELS")
-LOG_CHANNELS   = _parse_channels("LOG_CHANNELS")
-TOPIC_CHANNELS = _parse_channels("TOPIC_CHANNELS")
+CHAT_CHANNELS   = _parse_channels("CHAT_CHANNELS")
+RSS_CHANNELS    = _parse_channels("RSS_CHANNELS")
+LOG_CHANNELS    = _parse_channels("LOG_CHANNELS")
+TOPIC_CHANNELS  = _parse_channels("TOPIC_CHANNELS")
+MEMO_CHANNELS   = _parse_channels("MEMO_CHANNELS")
+REVIEW_CHANNELS = _parse_channels("REVIEW_CHANNELS")
 
 # 兼容旧配置：SOLO_CHANNEL_IDS 等同于 CHAT_CHANNELS
-_legacy = _parse_channels("SOLO_CHANNEL_IDS")
-CHAT_CHANNELS |= _legacy
+CHAT_CHANNELS |= _parse_channels("SOLO_CHANNEL_IDS")
 
 def get_channel_role(chan_id: str) -> str:
     """返回频道角色，默认 'mention'（需要 @ 才响应）。"""
-    if chan_id in CHAT_CHANNELS:  return "chat"
-    if chan_id in RSS_CHANNELS:   return "rss"
-    if chan_id in LOG_CHANNELS:   return "log"
-    if chan_id in TOPIC_CHANNELS: return "topic"
+    if chan_id in CHAT_CHANNELS:   return "chat"
+    if chan_id in RSS_CHANNELS:    return "rss"
+    if chan_id in LOG_CHANNELS:    return "log"
+    if chan_id in TOPIC_CHANNELS:  return "topic"
+    if chan_id in MEMO_CHANNELS:   return "memo"
+    if chan_id in REVIEW_CHANNELS: return "review"
     return "mention"
 
 # ── Bot 初始化 ────────────────────────────────────────────────────────────────
@@ -161,6 +166,11 @@ async def on_ready():
         health_check.start()
     # 启动定时任务（RSS + 每日早报）
     setup_scheduler(bot, call_llm)
+    # 启动通知
+    await log_to_channel(
+        f"✅ **Confettia 上线** `{discord.utils.utcnow().strftime('%m/%d %H:%M UTC')}`\n"
+        f"服务器：{len(bot.guilds)} 个｜Slash 命令：已同步"
+    )
 
 
 @bot.event
@@ -208,6 +218,13 @@ async def health_check():
         f"💓 健康检查｜Token：{usage['total']}/{usage['budget']} "
         f"({usage['pct']}%)｜调用：{usage['calls']}次｜队列：{len(_processing)}"
     )
+    # token 用量超过 70% 时推送到 log 频道
+    if usage["pct"] >= 70:
+        await log_to_channel(
+            f"⚠️ **Token 用量告警** {usage['pct']}%\n"
+            f"`{usage['total']:,} / {usage['budget']:,}` tokens 已用\n"
+            f"剩余：`{usage['remaining']:,}`｜调用：{usage['calls']} 次"
+        )
 
 @health_check.before_loop
 async def before_health():
@@ -234,7 +251,17 @@ async def on_message(message: discord.Message):
     if role in ("rss", "log"):
         return
 
-    # TOPIC 频道：检测 URL，自动展开总结（需 @ 或含 URL）
+    # MEMO 频道：静默存库，不回复
+    if role == "memo":
+        await _handle_memo(message, user_id)
+        return
+
+    # REVIEW 频道：代码/长文自动点评
+    if role == "review":
+        await _handle_review(message, user_id, chan_id)
+        return
+
+    # TOPIC 频道：检测 URL，自动展开总结
     if role == "topic":
         has_url = "http://" in message.content or "https://" in message.content
         if not has_url and not mentioned:
@@ -333,6 +360,81 @@ async def _handle_chat(
         await _send(message, "❌ 处理出错，请稍后重试。")
         if _error_count >= MAX_ERRORS:
             await _recovery()
+    finally:
+        _processing.discard(lock_key)
+
+
+# ── Log 频道通知 ──────────────────────────────────────────────────────────────
+async def log_to_channel(text: str):
+    """向所有 LOG_CHANNELS 发送一条通知，失败静默。"""
+    if not LOG_CHANNELS:
+        return
+    for chan_id in LOG_CHANNELS:
+        try:
+            channel = bot.get_channel(int(chan_id))
+            if channel:
+                await channel.send(text)
+        except Exception as e:
+            log.warning(f"log_to_channel 失败 ({chan_id}): {e}")
+
+
+# ── Memo 频道：静默存库 ───────────────────────────────────────────────────────
+async def _handle_memo(message: discord.Message, user_id: str):
+    """
+    存入 memo，加 ✅ reaction 表示已收到，不发文字回复。
+    保持频道界面干净。
+    """
+    content = message.content.strip()
+    if not content:
+        return
+    count = memo_store.save(user_id, content)
+    try:
+        await message.add_reaction("✅")
+        # 每存满 10 条，额外加一个提示 reaction
+        if count % 10 == 0:
+            await message.add_reaction("📓")
+    except Exception:
+        pass
+    log.info(f"Memo 已存：uid={user_id}，当前共 {count} 条未整理")
+
+
+# ── Review 频道：代码/长文点评 ────────────────────────────────────────────────
+async def _handle_review(message: discord.Message, user_id: str, chan_id: str):
+    """
+    检测消息类型，触发对应的 review prompt。
+    不触发条件（短文本、无代码块）则静默忽略。
+    """
+    triggered, review_type = should_review(message.content)
+    if not triggered:
+        return
+
+    lock_key = f"{user_id}:{chan_id}"
+    if lock_key in _processing:
+        await message.add_reaction("⏳")
+        return
+
+    if is_budget_exceeded():
+        await message.channel.send("🔴 今日预算已达上限，Review 暂停。")
+        return
+
+    prompt = build_review_prompt(message.content, review_type)
+    icon   = "🔍" if review_type == "code" else "📝"
+
+    _processing.add(lock_key)
+    try:
+        await message.add_reaction(icon)
+        async with message.channel.typing():
+            response = await asyncio.wait_for(
+                run_agent(user_id, chan_id, prompt, force_search=False),
+                timeout=45.0,
+            )
+        # review 频道不 quote，直接发，界面更干净
+        await send_long_message(message, response, quote=False)
+    except asyncio.TimeoutError:
+        await message.channel.send("⏱️ Review 超时，请稍后重试。")
+    except Exception as e:
+        log.error(f"review 失败：{e}", exc_info=True)
+        await message.channel.send("❌ Review 出错，请稍后重试。")
     finally:
         _processing.discard(lock_key)
 
