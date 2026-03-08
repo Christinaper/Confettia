@@ -51,6 +51,19 @@ def setup_scheduler(bot, call_llm_fn):
         misfire_grace_time=600,
     )
 
+    # ── 任务 3：每周日 memo 周报 ──────────────────────────────────────────────
+    scheduler.add_job(
+        _memo_weekly_job,
+        trigger="cron",
+        day_of_week="sun",
+        hour=DAILY_HOUR_UTC,
+        minute=30,
+        args=[bot, call_llm_fn],
+        id="memo_weekly",
+        name="Memo 周报",
+        misfire_grace_time=600,
+    )
+
     scheduler.start()
     log.info(
         f"定时任务已启动：RSS 每2小时检查，"
@@ -157,7 +170,54 @@ async def _daily_digest_job(bot, call_llm_fn):
     log.info("每日早报已推送")
 
 
-def _split_message(text: str, limit: int = 1900) -> list[str]:
+async def _memo_weekly_job(bot, call_llm_fn):
+    """每周日整理 memo，发回 CHAT_CHANNELS。"""
+    import os
+    from tools.memo import memo_store, format_weekly_digest
+
+    # 找所有有未发送 memo 的用户
+    # 简化：只处理 OWNER_ID，个人 Bot 场景够用
+    owner_id = os.getenv("OWNER_ID", "")
+    if not owner_id:
+        return
+
+    items = memo_store.get_unsent(owner_id)
+    if not items:
+        log.info("Memo 周报：无新内容")
+        return
+
+    # LLM 生成摘要
+    all_text = "\n".join(f"- {i['content']}" for i in items)
+    try:
+        summary = await call_llm_fn(
+            user_query=(
+                f"以下是我这周随手记的想法，用一句话（30字以内）概括主题趋势：\n{all_text}"
+            ),
+            system_prompt="你是简洁的笔记助手，只输出一句话总结，不加任何前缀。",
+        )
+        summary = summary.strip()
+    except Exception:
+        summary = f"共 {len(items)} 条想法等待回顾"
+
+    message = format_weekly_digest(owner_id, summary, items)
+
+    # 发到所有 CHAT_CHANNELS
+    chat_ids = os.getenv("CHAT_CHANNELS", "")
+    sent = False
+    for chan_id in (s.strip() for s in chat_ids.split(",") if s.strip()):
+        try:
+            channel = bot.get_channel(int(chan_id))
+            if channel:
+                for chunk in _split_message(message):
+                    await channel.send(chunk)
+                sent = True
+                break   # 发到第一个 chat 频道即可
+        except Exception as e:
+            log.warning(f"Memo 周报发送失败 ({chan_id}): {e}")
+
+    if sent:
+        memo_store.mark_sent(owner_id)
+        log.info(f"Memo 周报已发送：{len(items)} 条")
     if len(text) <= limit:
         return [text]
     return [text[i:i+limit] for i in range(0, len(text), limit)]
