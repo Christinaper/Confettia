@@ -22,6 +22,8 @@ class ConversationMemory:
         """初始化数据库表结构"""
         with self._get_conn() as conn:
             # 对话历史表
+            conn.execute("PRAGMA journal_mode=WAL;")   # ← 加这一行
+            conn.execute("PRAGMA synchronous=NORMAL;") # ← 搭配使用，性能更好
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
