@@ -580,13 +580,26 @@ async def slash_digest(
 
     try:
         if selected == "daily":
-            await _daily_digest_job(bot, call_llm)
+            result = await _daily_digest_job(bot, call_llm)
         else:
-            await _rss_check_job(bot, call_llm)
-        await interaction.followup.send("✅ 推送完成。", ephemeral=True)
+            result = await _rss_check_job(bot, call_llm)
+
+        # 根据返回状态显示真实结果
+        if result == "no_new":
+            msg = "ℹ️ 无新内容（所有 RSS 源均无更新）。"
+        elif result and result.startswith("ok:"):
+            val = result[3:]
+            msg = f"✅ 推送完成（{val}）。" if val != "daily" else "✅ 每日早报已推送。"
+        elif result and result.startswith("error:"):
+            msg = f"❌ 推送失败：{result[6:]}"
+        else:
+            msg = f"⚠️ 未知状态：{result}"
+
+        await interaction.followup.send(msg, ephemeral=True)
+
     except Exception as e:
         log.error(f"/digest 失败：{e}", exc_info=True)
-        await interaction.followup.send(f"❌ 推送失败：{e}", ephemeral=True)
+        await interaction.followup.send(f"❌ 执行失败：{e}", ephemeral=True)
 
 
 # ── Slash：/clear ─────────────────────────────────────────────────────────────
