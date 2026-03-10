@@ -86,6 +86,43 @@ def setup_scheduler(bot, call_llm_fn):
     return scheduler
 
 
+# ── RSS 智能过滤 ──────────────────────────────────────────────────────────────
+async def _score_items(items: list[dict], call_llm_fn) -> list[dict]:
+    """
+    让 LLM 对每条新闻打重要性分数（1-5），只推送 >= 3 分的。
+    失败时降级：全部推送。
+    """
+    if not items:
+        return items
+
+    titles = "\n".join(f"{i+1}. {item['title']}" for i, item in enumerate(items))
+    prompt = (
+        f"以下是 AI 行业新闻标题，请为每条打重要性分数（1=普通更新，3=值得关注，5=重大突破）。\n"
+        f"只输出 JSON 数组，格式：[分数1, 分数2, ...]，数量必须和标题数量一致。\n\n"
+        f"{titles}"
+    )
+    try:
+        import json
+        result = await call_llm_fn(
+            user_query=prompt,
+            system_prompt="你是 AI 资讯评级助手，只输出 JSON 数组，不加任何其他内容。",
+        )
+        # 清理可能的 markdown 代码块
+        result = result.strip().strip("```json").strip("```").strip()
+        scores = json.loads(result)
+        if len(scores) != len(items):
+            raise ValueError("分数数量和新闻数量不一致")
+
+        filtered = [item for item, score in zip(items, scores) if score >= 3]
+        skipped  = len(items) - len(filtered)
+        log.info(f"RSS 智能过滤：{len(items)} 条 → {len(filtered)} 条（过滤 {skipped} 条低重要性）")
+        return filtered
+
+    except Exception as e:
+        log.warning(f"RSS 评分失败，降级为全部推送：{e}")
+        return items
+
+
 # ── RSS 检查任务 ──────────────────────────────────────────────────────────────
 async def _rss_check_job(bot, call_llm_fn) -> str:
     """
@@ -101,7 +138,13 @@ async def _rss_check_job(bot, call_llm_fn) -> str:
         log.info("RSS 检查：无新内容")
         return "no_new"
 
-    log.info(f"RSS 检查：{len(items)} 条新内容，准备推送")
+    log.info(f"RSS 检查：{len(items)} 条新内容，开始评分过滤")
+
+    # 智能过滤
+    items = await _score_items(items, call_llm_fn)
+    if not items:
+        log.info("RSS 检查：评分后无值得推送的内容")
+        return "no_new"
 
     # LLM 一句话点评（失败不阻塞推送）
     summary = ""
