@@ -1,16 +1,13 @@
 # tools/scheduler.py
-# 定时任务管理 — RSS 推送 + 每日早报 + Memo 周报
+# 定时任务：RSS 智能推送 + 每日早报 + Memo 周报
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 log = logging.getLogger("scheduler")
 
-# 推送频道 ID（从 .env 读取）
-DIGEST_CHANNEL_ID = int(os.getenv("DIGEST_CHANNEL_ID", "0"))
-# 每日早报时间（UTC，北京时间 = UTC+8，早上9点 = UTC 01:00）
-DAILY_HOUR_UTC    = int(os.getenv("DAILY_HOUR_UTC", "1"))
+DAILY_HOUR_UTC = int(os.getenv("DAILY_HOUR_UTC", "1"))
 
 
 # ── 工具函数（必须在所有 job 函数之前定义）────────────────────────────────────
@@ -20,18 +17,41 @@ def _split_message(text: str, limit: int = 1900) -> list[str]:
     return [text[i:i+limit] for i in range(0, len(text), limit)]
 
 
-async def _send_to_channel(bot, channel_id: int, text: str) -> bool:
-    """发送消息到指定频道，返回是否成功。"""
-    if not channel_id:
-        log.warning("未配置 DIGEST_CHANNEL_ID，跳过推送")
-        return False
-    channel = bot.get_channel(channel_id)
+def _now_bj() -> str:
+    """返回当前北京时间字符串，用于消息显示。"""
+    bj = datetime.now(timezone.utc) + timedelta(hours=8)
+    return bj.strftime("%m/%d %H:%M")
+
+
+def _get_rss_channel(bot):
+    """
+    获取 RSS 推送目标频道。
+    优先使用 RSS_CHANNELS（第一个），不存在则返回 None。
+    统一入口，避免 DIGEST_CHANNEL_ID 和 RSS_CHANNELS 双轨并存。
+    """
+    raw = os.getenv("RSS_CHANNELS", "")
+    ids = [s.strip() for s in raw.split(",") if s.strip()]
+    if not ids:
+        log.warning("未配置 RSS_CHANNELS，RSS 推送无目标频道")
+        return None
+    channel = bot.get_channel(int(ids[0]))
+    if not channel:
+        log.warning(f"RSS_CHANNELS 第一个频道 {ids[0]} 未找到（Bot 未缓存或 ID 有误）")
+    return channel
+
+
+async def _send_to_channel(channel, text: str) -> bool:
+    """发送消息到指定频道对象，返回是否成功。"""
     if not channel:
         log.warning(f"找不到频道 {channel_id}，可能 Bot 尚未缓存")
         return False
-    for chunk in _split_message(text):
-        await channel.send(chunk)
-    return True
+    try:
+        for chunk in _split_message(text):
+            await channel.send(chunk)
+        return True
+    except Exception as e:
+        log.error(f"发送失败（{channel.id}）：{e}")
+        return False
 
 
 # ── Scheduler 注册 ────────────────────────────────────────────────────────────
@@ -49,16 +69,16 @@ def setup_scheduler(bot, call_llm_fn):
 
     scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # ── 任务 1：每 2 小时检查 RSS 更新（有新内容才推送）──────────────────────
+    # RSS 检查：每 2 小时，整点触发
     scheduler.add_job(
         _rss_check_job,
-        trigger="interval", hours=2,
+        trigger="cron", minute=0, hour="*/2",
         args=[bot, call_llm_fn],
         id="rss_check", name="RSS 更新检查",
         misfire_grace_time=300,
     )
 
-    # ── 任务 2：每日早报（固定时间，有内容则发摘要）─────────────────────────
+    # 每日早报：北京时间早上 9 点 = UTC 01:00
     scheduler.add_job(
         _daily_digest_job,
         trigger="cron", hour=DAILY_HOUR_UTC, minute=0,
@@ -67,7 +87,7 @@ def setup_scheduler(bot, call_llm_fn):
         misfire_grace_time=600,
     )
 
-    # ── 任务 3：每周日 memo 周报 ──────────────────────────────────────────────
+    # Memo 周报：每周日早报时间后 30 分钟
     scheduler.add_job(
         _memo_weekly_job,
         trigger="cron", day_of_week="sun",
@@ -78,10 +98,11 @@ def setup_scheduler(bot, call_llm_fn):
     )
 
     scheduler.start()
+    bj_hour = (DAILY_HOUR_UTC + 8) % 24
     log.info(
-        f"定时任务已启动：RSS 每2小时检查，"
-        f"早报每天 {DAILY_HOUR_UTC:02d}:00 UTC"
-        f"（北京时间 {(DAILY_HOUR_UTC+8)%24:02d}:00）"
+        f"定时任务已启动："
+        f"RSS 每2小时整点检查，"
+        f"早报 UTC {DAILY_HOUR_UTC:02d}:00（北京 {bj_hour:02d}:00）"
     )
     return scheduler
 
@@ -146,7 +167,7 @@ async def _rss_check_job(bot, call_llm_fn) -> str:
         log.info("RSS 检查：评分后无值得推送的内容")
         return "no_new"
 
-    # LLM 一句话点评（失败不阻塞推送）
+    # LLM 一句话点评
     summary = ""
     try:
         titles = "、".join(i["title"] for i in items[:5])
@@ -158,7 +179,9 @@ async def _rss_check_job(bot, call_llm_fn) -> str:
     except Exception as e:
         log.warning(f"RSS 摘要生成失败（跳过）：{e}")
 
-    message = format_digest(items, summary)
+    # 时间戳用北京时间，和频道里看到的一致
+    now_str = _now_bj()
+    message = format_digest(items, summary, now_str)
 
     try:
         ok = await _send_to_channel(bot, DIGEST_CHANNEL_ID, message)
@@ -208,8 +231,9 @@ async def _daily_digest_job(bot, call_llm_fn) -> str:
         log.error(f"每日早报 LLM 调用失败：{e}")
         return f"error:LLM 调用失败 {e}"
 
-    now_bj = (datetime.now(timezone.utc).hour + 8) % 24
-    header = f"🌅 **早安！今日 AI 速递** `{now_bj:02d}:00 北京时间`\n\n"
+    # 北京时间标签（和定时触发时间一致）
+    now_str  = _now_bj()
+    header   = f"🌅 **早安！今日 AI 速递** `{now_str} 北京时间`\n\n"
     full_msg = header + digest_text.strip()
 
     if rss_items:
