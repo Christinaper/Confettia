@@ -33,11 +33,11 @@ log = logging.getLogger("bot")
 # ── 代理 ──────────────────────────────────────────────────────────────────────
 PROXY = os.getenv("PROXY", "")
 
-# ── 安全参数 ──────────────────────────────────────────────────────────────────
-MAX_INPUT_LEN    = int(os.getenv("MAX_INPUT_LEN",    "500"))
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
-COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))
-GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))
+# ── 安全参数（可通过 .env 调整）──────────────────────────────────────────────
+MAX_INPUT_LEN    = int(os.getenv("MAX_INPUT_LEN",    "500"))   # 单条消息最大字符
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))    # 用户冷却秒数
+COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))     # 冷却窗口内最大次数
+GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))    # 全局每分钟最大请求数
 
 # ── 频道角色配置 ──────────────────────────────────────────────────────────────
 # 每个频道 ID 只能属于一个角色，角色决定 Bot 的行为。
@@ -73,10 +73,11 @@ MEMO_CHANNELS   = _parse_channels("MEMO_CHANNELS")
 REVIEW_CHANNELS = _parse_channels("REVIEW_CHANNELS")
 FORUM_CHANNELS  = _parse_channels("FORUM_CHANNELS")   # 论坛频道：每条 RSS 开独立帖子
 
-# 兼容旧配置
+# 兼容旧配置：SOLO_CHANNEL_IDS 等同于 CHAT_CHANNELS
 CHAT_CHANNELS |= _parse_channels("SOLO_CHANNEL_IDS")
 
 def get_channel_role(chan_id: str) -> str:
+    """返回频道角色，默认 'mention'（需要 @ 才响应）。"""
     if chan_id in CHAT_CHANNELS:   return "chat"
     if chan_id in RSS_CHANNELS:    return "rss"
     if chan_id in LOG_CHANNELS:    return "log"
@@ -178,6 +179,7 @@ async def on_ready():
         log.error(f"   Slash 命令同步失败：{e}")
     if not health_check.is_running():
         health_check.start()
+    # 启动定时任务（RSS + 每日早报）
     setup_scheduler(bot, call_llm)
     # 启动通知
     await log_to_channel(
@@ -249,7 +251,7 @@ async def before_health():
 async def on_message(message: discord.Message):
     global _error_count
 
-    # Bot 消息一律忽略（防死循环）
+    # [安全] Bot 消息一律忽略（防死循环）
     if message.author.bot:
         return
 
@@ -313,30 +315,39 @@ async def _handle_chat(
     """chat / mention 频道的通用对话处理。"""
     lock_key = f"{user_id}:{chan_id}"
 
+    # [安全] 日预算熔断
     if is_budget_exceeded():
         await _send(message, "🔴 **今日预算已达上限**，UTC 00:00 自动重置。")
         return
+
+    # [安全] 全局 RPM 限制
     if not _check_global_rpm():
         await message.add_reaction("🚫")
         return
 
+    # [安全] 用户冷却
     allowed, wait_sec = _check_user_cooldown(user_id)
     if not allowed:
         await _send(message, f"⏳ 请 **{wait_sec}s** 后再试。", delete_after=8)
         return
+
+    # [安全] 并发锁
     if lock_key in _processing:
         await message.add_reaction("⏳")
         return
 
+    # 清洗输入：not quote频道去掉 @ 标签
     raw = (
         message.content
         if not quote                                          # chat 频道：全文
         else message.content.replace(f"<@{bot.user.id}>", "").strip()
     )
     if not raw:
-        return
+        return  # 收到空消息（如纯表情）静默忽略
 
     was_truncated, user_input = _sanitize_input(raw)
+
+    # 记录本次请求（冷却窗口计入）
     _record_user_request(user_id)
     _processing.add(lock_key)
 
@@ -348,6 +359,8 @@ async def _handle_chat(
             )
         global _error_count
         _error_count = 0
+
+        # 如果输入被截断，在回复前加提示
         if was_truncated:
             response = f"> ⚠️ 消息超过 {MAX_INPUT_LEN} 字符，已截取前段。\n\n" + response
         await send_long_message(message, response, quote=quote)

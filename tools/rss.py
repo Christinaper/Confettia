@@ -190,6 +190,7 @@ def format_digest(items: list[dict], summary_by_llm: str = "",
     if summary_by_llm:
         lines.append(f"> {summary_by_llm}\n")
 
+    # 按来源分组
     by_feed: dict[str, list] = {}
     for item in items:
         by_feed.setdefault(item["tag"], []).append(item)
