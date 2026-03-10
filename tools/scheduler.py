@@ -154,6 +154,10 @@ async def _rss_check_job(bot, call_llm_fn) -> str:
     """
     from tools.rss import fetch_all_feeds, mark_items_seen, format_digest
 
+    channel = _get_rss_channel(bot)
+    if not channel:
+        return "error:未配置 RSS_CHANNELS 或频道未找到"
+
     items = await fetch_all_feeds()
     if not items:
         log.info("RSS 检查：无新内容")
@@ -170,14 +174,14 @@ async def _rss_check_job(bot, call_llm_fn) -> str:
     # LLM 一句话点评
     summary = ""
     try:
-        titles = "、".join(i["title"] for i in items[:5])
+        titles  = "、".join(i["title"] for i in items[:5])
         summary = await call_llm_fn(
             user_query=f"用一句话（20字以内）点评这些 AI 新闻的整体趋势：{titles}",
-            system_prompt="你是简洁的新闻点评员，只输出一句话，不超过20字，语气活泼。",
+            system_prompt="只输出一句话，不超过20字，语气活泼，不加前缀。",
         )
         summary = summary.strip().replace("\n", "")
     except Exception as e:
-        log.warning(f"RSS 摘要生成失败（跳过）：{e}")
+        log.warning(f"RSS 摘要生成失败：{e}")
 
     # 时间戳用北京时间，和频道里看到的一致
     now_str = _now_bj()
@@ -206,7 +210,7 @@ async def _daily_digest_job(bot, call_llm_fn) -> str:
     try:
         search_results = await web_search("AI LLM 最新动态 今日")
     except Exception as e:
-        log.warning(f"早报搜索失败（跳过）：{e}")
+        log.warning(f"早报搜索失败：{e}")
 
     # LLM 生成早报摘要
     rss_titles = "\n".join(f"- {i['title']}" for i in rss_items[:5])
@@ -237,19 +241,15 @@ async def _daily_digest_job(bot, call_llm_fn) -> str:
     full_msg = header + digest_text.strip()
 
     if rss_items:
-        rss_section = format_digest(rss_items[:3])
-        full_msg += f"\n\n{rss_section}"
+        full_msg += f"\n\n{format_digest(rss_items[:3], '', now_str)}"
         mark_items_seen(rss_items)
 
-    try:
-        ok = await _send_to_channel(bot, DIGEST_CHANNEL_ID, full_msg)
-        if not ok:
-            return "error:找不到推送频道"
-        log.info("每日早报已推送")
-        return "ok:daily"
-    except Exception as e:
-        log.error(f"早报推送失败：{e}", exc_info=True)
-        return f"error:{e}"
+    ok = await _send_to_channel(channel, full_msg)
+    if not ok:
+        return "error:消息发送失败"
+
+    log.info(f"每日早报已推送 → #{channel.name}")
+    return "ok:daily"
 
 
 # ── Memo 周报任务 ─────────────────────────────────────────────────────────────
@@ -272,7 +272,7 @@ async def _memo_weekly_job(bot, call_llm_fn) -> str:
     try:
         summary = await call_llm_fn(
             user_query=f"以下是我这周随手记的想法，用一句话（30字以内）概括主题趋势：\n{all_text}",
-            system_prompt="你是简洁的笔记助手，只输出一句话总结，不加任何前缀。",
+            system_prompt="只输出一句话总结，不加任何前缀。",
         )
         summary = summary.strip()
     except Exception:
@@ -280,18 +280,20 @@ async def _memo_weekly_job(bot, call_llm_fn) -> str:
 
     message = format_weekly_digest(owner_id, summary, items)
 
-    # 发到所有 CHAT_CHANNELS
-    chat_ids = os.getenv("CHAT_CHANNELS", "")
-    for chan_id in (s.strip() for s in chat_ids.split(",") if s.strip()):
+    # Memo 周报发到 CHAT_CHANNELS 第一个
+    chat_raw = os.getenv("CHAT_CHANNELS", "")
+    chat_ids = [s.strip() for s in chat_raw.split(",") if s.strip()]
+
+    for chan_id in chat_ids:
         try:
             channel = bot.get_channel(int(chan_id))
             if channel:
-                for chunk in _split_message(message):
-                    await channel.send(chunk)
-                memo_store.mark_sent(owner_id)
-                log.info(f"Memo 周报已发送：{len(items)} 条")
-                return f"ok:{len(items)}"
+                ok = await _send_to_channel(channel, message)
+                if ok:
+                    memo_store.mark_sent(owner_id)
+                    log.info(f"Memo 周报已发送：{len(items)} 条 → #{channel.name}")
+                    return f"ok:{len(items)}"
         except Exception as e:
             log.warning(f"Memo 周报发送失败 ({chan_id}): {e}")
 
-    return "error:所有 chat 频道发送失败"
+    return "error:所有 CHAT_CHANNELS 发送失败"

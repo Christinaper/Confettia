@@ -171,16 +171,21 @@ def mark_items_seen(items: list[dict]):
         _seen.mark_seen(item["url"], item["feed_name"], item["title"])
 
 
-def format_digest(items: list[dict], summary_by_llm: str = "") -> str:
+def format_digest(items: list[dict], summary_by_llm: str = "",
+                  now_str: str = "") -> str:
     """
     格式化推送消息。
-    summary_by_llm: 由 LLM 生成的整体摘要（可选）
+    now_str: 北京时间字符串，由调用方传入保证一致性。
     """
     if not items:
         return ""
 
-    now = datetime.now(timezone.utc).strftime("%m/%d %H:%M UTC")
-    lines = [f"## 📡 AI 动态速报 `{now}`\n"]
+    if not now_str:
+        now_str = (datetime.now(timezone.utc) +
+                   __import__('datetime').timedelta(hours=8)
+                   ).strftime("%m/%d %H:%M")
+
+    lines = [f"## 📡 AI 动态速报 `{now_str} BJT`\n"]
 
     if summary_by_llm:
         lines.append(f"> {summary_by_llm}\n")
