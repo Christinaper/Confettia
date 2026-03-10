@@ -73,11 +73,10 @@ MEMO_CHANNELS   = _parse_channels("MEMO_CHANNELS")
 REVIEW_CHANNELS = _parse_channels("REVIEW_CHANNELS")
 FORUM_CHANNELS  = _parse_channels("FORUM_CHANNELS")   # 论坛频道：每条 RSS 开独立帖子
 
-# 兼容旧配置：SOLO_CHANNEL_IDS 等同于 CHAT_CHANNELS
+# 兼容旧配置
 CHAT_CHANNELS |= _parse_channels("SOLO_CHANNEL_IDS")
 
 def get_channel_role(chan_id: str) -> str:
-    """返回频道角色，默认 'mention'（需要 @ 才响应）。"""
     if chan_id in CHAT_CHANNELS:   return "chat"
     if chan_id in RSS_CHANNELS:    return "rss"
     if chan_id in LOG_CHANNELS:    return "log"
@@ -179,7 +178,6 @@ async def on_ready():
         log.error(f"   Slash 命令同步失败：{e}")
     if not health_check.is_running():
         health_check.start()
-    # 启动定时任务（RSS + 每日早报）
     setup_scheduler(bot, call_llm)
     # 启动通知
     await log_to_channel(
@@ -251,7 +249,7 @@ async def before_health():
 async def on_message(message: discord.Message):
     global _error_count
 
-    # [安全] Bot 消息一律忽略（防死循环）
+    # Bot 消息一律忽略（防死循环）
     if message.author.bot:
         return
 
@@ -315,39 +313,30 @@ async def _handle_chat(
     """chat / mention 频道的通用对话处理。"""
     lock_key = f"{user_id}:{chan_id}"
 
-    # [安全] 日预算熔断
     if is_budget_exceeded():
         await _send(message, "🔴 **今日预算已达上限**，UTC 00:00 自动重置。")
         return
-
-    # [安全] 全局 RPM 限制
     if not _check_global_rpm():
         await message.add_reaction("🚫")
         return
 
-    # [安全] 用户冷却
     allowed, wait_sec = _check_user_cooldown(user_id)
     if not allowed:
         await _send(message, f"⏳ 请 **{wait_sec}s** 后再试。", delete_after=8)
         return
-
-    # [安全] 并发锁
     if lock_key in _processing:
         await message.add_reaction("⏳")
         return
 
-    # 清洗输入：not quote频道去掉 @ 标签
     raw = (
         message.content
         if not quote                                          # chat 频道：全文
         else message.content.replace(f"<@{bot.user.id}>", "").strip()
     )
     if not raw:
-        return  # 收到空消息（如纯表情）静默忽略
+        return
 
     was_truncated, user_input = _sanitize_input(raw)
-
-    # 记录本次请求（冷却窗口计入）
     _record_user_request(user_id)
     _processing.add(lock_key)
 
@@ -359,8 +348,6 @@ async def _handle_chat(
             )
         global _error_count
         _error_count = 0
-
-        # 如果输入被截断，在回复前加提示
         if was_truncated:
             response = f"> ⚠️ 消息超过 {MAX_INPUT_LEN} 字符，已截取前段。\n\n" + response
         await send_long_message(message, response, quote=quote)
@@ -658,6 +645,80 @@ async def slash_digest(
     except Exception as e:
         log.error(f"/digest 失败：{e}", exc_info=True)
         await interaction.followup.send(f"❌ 执行失败：{e}", ephemeral=True)
+
+
+# ── Slash：/forum-test（论坛频道测试，仅主人）─────────────────────────────────
+@bot.tree.command(name="forum-test", description="🧵 向论坛频道发一条测试帖（仅主人）")
+async def slash_forum_test(interaction: discord.Interaction):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ 仅 Bot 主人可用。", ephemeral=True)
+        return
+
+    if not FORUM_CHANNELS:
+        await interaction.response.send_message(
+            "❌ 未配置 `FORUM_CHANNELS`，请在 `.env` 里添加论坛频道 ID。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    results = []
+    for chan_id in FORUM_CHANNELS:
+        channel = bot.get_channel(int(chan_id))
+        if not channel:
+            results.append(f"❌ 频道 `{chan_id}` 未找到（ID 有误或 Bot 未缓存）")
+            continue
+
+        if not isinstance(channel, discord.ForumChannel):
+            results.append(
+                f"❌ `#{channel.name}` 不是论坛频道（当前类型：{type(channel).__name__}）\n"
+                f"  → 请在 Discord 建立**论坛**类型的频道，不是普通文字频道"
+            )
+            continue
+
+        # 显示已有标签
+        available = [t.name for t in channel.available_tags]
+        tag_names = ["AI", "Anthropic", "OpenAI"]
+        applied   = []
+        missing   = []
+        for name in tag_names:
+            matched = discord.utils.get(channel.available_tags, name=name)
+            if matched:
+                applied.append(matched)
+            else:
+                missing.append(name)
+
+        try:
+            thread, _ = await channel.create_thread(
+                name="🧪 Bot 论坛功能测试帖",
+                content=(
+                    "这是一条由 Confettia 发布的测试帖 ✅\n\n"
+                    "**论坛频道的用法：**\n"
+                    "• 每条 RSS 文章 = 一个独立帖子，有标题，可以搜索\n"
+                    "• 在帖子里回复 = 针对这篇文章的讨论，不会和其他文章混在一起\n"
+                    "• 标签过滤：点击标签名可以筛选同类文章\n\n"
+                    f"**已匹配标签：** {', '.join(t.name for t in applied) or '（无）'}\n"
+                    f"**频道全部标签：** {', '.join(available) or '（未设置）'}"
+                ),
+                applied_tags=applied,
+            )
+            tag_status = ""
+            if missing:
+                tag_status = f"\n  ⚠️ 标签不存在（需在论坛频道手动创建）：`{'`、`'.join(missing)}`"
+            results.append(
+                f"✅ `#{channel.name}` 发帖成功\n"
+                f"  帖子：**{thread.name}**{tag_status}"
+            )
+        except discord.Forbidden:
+            results.append(
+                f"❌ `#{channel.name}` 权限不足\n"
+                f"  → 确认 Bot 在该频道有「发送消息」和「管理帖子」权限"
+            )
+        except Exception as e:
+            results.append(f"❌ `#{channel.name}` 发帖失败：{e}")
+
+    await interaction.followup.send("\n\n".join(results), ephemeral=True)
 
 
 # ── Slash：/clear ─────────────────────────────────────────────────────────────
