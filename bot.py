@@ -40,13 +40,26 @@ COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))     # 冷却窗口内
 GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))    # 全局每分钟最大请求数
 
 # ── 频道角色配置 ──────────────────────────────────────────────────────────────
-# .env 配置示例 里按角色分别填频道 ID（逗号分隔）：
-#   CHAT_CHANNELS=111       独聊，无需 @，无 quote
-#   RSS_CHANNELS=222        只收推送，忽略用户消息
-#   LOG_CHANNELS=333        Bot 状态日志，忽略用户消息
-#   TOPIC_CHANNELS=444      含 URL 自动展开
-#   MEMO_CHANNELS=555       存储碎片想法，不回复
-#   REVIEW_CHANNELS=666     代码/长文自动点评
+# 每个频道 ID 只能属于一个角色，角色决定 Bot 的行为。
+# 一个角色可以有多个频道 ID（逗号分隔），但推送类任务只发到第一个。
+#
+# 角色定义：
+#   CHAT_CHANNELS    独聊：无需 @，无 quote，自由对话（猫娘）
+#   RSS_CHANNELS     推送：接收 RSS 定时推送和每日早报，忽略用户消息
+#                    ⚠️  推送任务只发到第一个 ID，多个 ID 仅作路由识别用
+#   LOG_CHANNELS     日志：Bot 状态通知（启动/告警），忽略用户消息
+#                    ⚠️  所有 LOG_CHANNELS 都会收到通知（广播模式）
+#   TOPIC_CHANNELS   话题：含 URL 自动展开总结
+#   MEMO_CHANNELS    备忘：存储碎片想法，加 reaction 不回复
+#   REVIEW_CHANNELS  评审：代码/长文自动点评
+#
+# 多频道防重复规则：
+#   - 对话类（CHAT/TOPIC/MEMO/REVIEW）：每条消息只在触发频道内响应，不跨频道
+#   - 推送类（RSS）：只推到 RSS_CHANNELS 第一个频道
+#   - 日志类（LOG）：广播到所有 LOG_CHANNELS（通常只配一个）
+#
+# 一个频道 ID 出现在多个角色里时，优先级：
+#   chat > rss > log > topic > memo > review > mention（默认）
 
 def _parse_channels(env_key: str) -> set[str]:
     raw = os.getenv(env_key, "")
