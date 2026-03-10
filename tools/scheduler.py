@@ -187,15 +187,30 @@ async def _rss_check_job(bot, call_llm_fn) -> str:
     now_str = _now_bj()
     message = format_digest(items, summary, now_str)
 
-    try:
-        ok = await _send_to_channel(bot, DIGEST_CHANNEL_ID, message)
-        if not ok:
-            return "error:找不到推送频道，请检查 DIGEST_CHANNEL_ID"
-        mark_items_seen(items)
-        return f"ok:{len(items)}"
-    except Exception as e:
-        log.error(f"RSS 推送失败：{e}", exc_info=True)
-        return f"error:{e}"
+    ok = await _send_to_channel(channel, message)
+    if not ok:
+        return "error:消息发送失败"
+
+    # 同步发到论坛频道（每篇文章一个独立帖子）
+    forum_raw = os.getenv("FORUM_CHANNELS", "")
+    if forum_raw:
+        # 延迟导入避免循环
+        from bot import post_to_forum
+        for item in items:
+            body = (
+                f"**来源：** {item['tag']}\n"
+                f"**链接：** {item['url']}\n\n"
+                f"{item.get('summary', '')}"
+            )
+            await post_to_forum(
+                title=item["title"][:100],
+                content=body,
+                tags=["AI", item["feed_name"][:20]],
+            )
+
+    mark_items_seen(items)
+    log.info(f"RSS 推送完成：{len(items)} 条 → #{channel.name}")
+    return f"ok:{len(items)}"
 
 
 # ── 每日早报任务 ──────────────────────────────────────────────────────────────
@@ -203,16 +218,18 @@ async def _daily_digest_job(bot, call_llm_fn) -> str:
     from tools.rss import fetch_all_feeds, mark_items_seen, format_digest
     from tools.search import web_search
 
+    channel = _get_rss_channel(bot)
+    if not channel:
+        return "error:未配置 RSS_CHANNELS 或频道未找到"
+
     rss_items = await fetch_all_feeds()
 
-    # 搜索补充（失败不阻塞）
     search_results = ""
     try:
         search_results = await web_search("AI LLM 最新动态 今日")
     except Exception as e:
         log.warning(f"早报搜索失败：{e}")
 
-    # LLM 生成早报摘要
     rss_titles = "\n".join(f"- {i['title']}" for i in rss_items[:5])
     prompt = (
         f"今日 AI 资讯早报，请用 3 条要点总结（每条不超过 40 字）：\n\n"
@@ -226,9 +243,8 @@ async def _daily_digest_job(bot, call_llm_fn) -> str:
         digest_text = await call_llm_fn(
             user_query=prompt,
             system_prompt=(
-                "你是 AI 资讯助手，用 Discord Markdown 格式输出每日早报，"
-                "3 条要点，每条一行，加 emoji。"
-                "严格基于提供的资料，没有来源的内容不要添加。"
+                "你是 AI 资讯助手，用 Discord Markdown 输出每日早报，"
+                "3 条要点，每条一行，加 emoji，严格基于提供资料。"
             ),
         )
     except Exception as e:
@@ -267,7 +283,6 @@ async def _memo_weekly_job(bot, call_llm_fn) -> str:
         log.info("Memo 周报：无新内容")
         return "no_new"
 
-    # LLM 生成摘要
     all_text = "\n".join(f"- {i['content']}" for i in items)
     try:
         summary = await call_llm_fn(
