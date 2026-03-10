@@ -88,14 +88,14 @@ async def _call_deepseek(prompt: str, history: list, system_prompt: str) -> str:
                           timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status == 402:
                 log.error("DeepSeek 余额不足")
-                return "❌ **DeepSeek 余额不足**, 请登录 platform.deepseek.com 充值。"
+                return "❌ **DeepSeek 余额不足**，请登录 platform.deepseek.com 充值。"
             if resp.status == 429:
-                return "⚠️ 请求过频, 请稍等片刻。"
+                return "⚠️ 请求过频，请稍等片刻。"
             if resp.status != 200:
                 txt = await resp.text()
                 log.error(f"DeepSeek HTTP {resp.status}: {txt[:200]}")
                 _token_usage["errors"] += 1
-                return f"❌ API 错误 {resp.status}, 请稍后重试。"
+                return f"❌ API 错误 {resp.status}，请稍后重试。"
             data  = await resp.json()
             usage = data.get("usage", {})
             _add_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
@@ -130,8 +130,8 @@ async def _call_gemini(prompt: str, history: list, system_prompt: str) -> str:
         err = str(e)
         _token_usage["errors"] += 1
         if "429" in err or "RESOURCE_EXHAUSTED" in err:
-            return "⚠️ **Gemini 配额耗尽**, 请在 `.env` 添加 `DEEPSEEK_API_KEY` 后重启。"
-        return f"❌ Gemini 错误: {err[:100]}"
+            return "⚠️ **Gemini 配额耗尽**，请在 `.env` 添加 `DEEPSEEK_API_KEY` 后重启。"
+        return f"❌ Gemini 错误：{err[:100]}"
 
 # ── 统一入口 ──────────────────────────────────────────────────────────────────
 async def call_llm(
@@ -148,7 +148,10 @@ async def call_llm(
         system_prompt = "你是专业的 Discord 信息助手, 用 Markdown 格式简洁回复, 不超过800字符。"
 
     prompt = _truncate(
-        f"用户问题: {user_query}\n\n搜索结果: \n{'─'*28}\n{search_context}\n{'─'*28}\n请综合分析简洁回答。"
+        f"用户问题：{user_query}\n\n"
+        f"参考资料：\n{'─'*28}\n{search_context}\n{'─'*28}\n\n"
+        f"要求：严格基于以上参考资料回答。资料中没有的具体数据不要编造，"
+        f"如资料不足请直接说明。"
         if search_context else user_query,
         MAX_INPUT_CHARS,
     )
