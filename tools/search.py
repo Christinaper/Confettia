@@ -8,10 +8,24 @@ import logging
 log = logging.getLogger("search")
 
 SEARCH_TRIGGERS = [
-    "搜索", "查找", "最新", "现在", "今天", "新闻", "动态",
-    "价格", "是什么", "有什么", "怎么样", "如何", "多少",
-    "search", "find", "latest", "news", "what", "how", "price",
+    # 明确要求搜索或查询实时信息
+    "搜索", "查一下", "查查", "帮我查",
+    # 时效性强的词
+    "最新", "最近", "今天", "今日", "现在", "当前", "目前",
+    "刚刚", "新闻", "动态", "发布", "上线", "更新",
+    # 价格/数据类
+    "价格", "多少钱", "汇率", "股价",
+    # 明确年份（近年事件）
     "2025", "2026",
+    # 英文
+    "latest", "recent", "news", "search", "current", "today",
+]
+
+# 即使包含触发词也不搜索的场景（闲聊、解释概念等）
+SEARCH_EXCLUDES = [
+    "你觉得", "你认为", "你喜欢", "你是", "你好",
+    "什么意思", "怎么理解", "解释", "帮我写", "帮我改",
+    "翻译", "总结一下", "分析一下",
 ]
 
 MAX_RESULT_CHARS = 800   # 每条搜索结果最大字符数
@@ -19,7 +33,11 @@ MAX_RESULTS      = 3     # 最多取几条结果
 
 
 def should_search(user_input: str) -> bool:
-    return any(t in user_input.lower() for t in SEARCH_TRIGGERS)
+    lower = user_input.lower()
+    # 先检查排除词——命中排除词则不搜索
+    if any(t in lower for t in SEARCH_EXCLUDES):
+        return False
+    return any(t in lower for t in SEARCH_TRIGGERS)
 
 
 def _trim_result(text: str) -> str:
