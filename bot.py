@@ -172,17 +172,27 @@ async def on_ready():
     if PROXY:
         log.info(f"   代理：{PROXY}")
     try:
-        synced = await bot.tree.sync()
-        log.info(f"   Slash 命令同步：{len(synced)} 个")
+        await bot.wait_until_ready()
+        total = 0
+        for guild in bot.guilds:
+            synced = await bot.tree.sync(guild=guild)
+            total += len(synced)
+            log.info(f"   Guild [{guild.name}] 同步：{len(synced)} 个命令")
+            
+        log.info(f"   Slash 命令同步：{len(synced)} 个（Guild 级别，立即生效）")
+        # log.info(f"   Slash 命令同步：{len(synced)} 个")
     except Exception as e:
         log.error(f"   Slash 命令同步失败：{e}")
+        await log_to_channel(f"⚠️ **Slash 命令同步失败**\n```{e}```")
     if not health_check.is_running():
         health_check.start()
     setup_scheduler(bot, call_llm)
     # 启动通知
     await log_to_channel(
         f"✅ **Confettia 上线** `{discord.utils.utcnow().strftime('%m/%d %H:%M UTC')}`\n"
-        f"服务器：{len(bot.guilds)} 个｜Slash 命令：已同步"
+        f"服务器：{len(bot.guilds)} 个｜Slash 命令：{len(synced)} 个已同步"
+        # f"✅ **Confettia 上线** `{discord.utils.utcnow().strftime('%m/%d %H:%M UTC')}`\n"
+        # f"服务器：{len(bot.guilds)} 个｜Slash 命令：已同步"
     )
 
 
