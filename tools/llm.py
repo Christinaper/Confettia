@@ -15,11 +15,23 @@ log = logging.getLogger("llm")
 DEEPSEEK_KEY       = os.getenv("DEEPSEEK_API_KEY", "")
 GEMINI_KEY         = os.getenv("GEMINI_API_KEY", "")
 ACTIVE_PROVIDER    = "deepseek" if DEEPSEEK_KEY else ("gemini" if GEMINI_KEY else "none")
-DAILY_TOKEN_BUDGET = int(os.getenv("DAILY_TOKEN_BUDGET", "15000"))
+def _get_int_env(name: str, default: int) -> int:
+    """读取 int 环境变量，失败时返回默认值并记录警告。"""
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(f"环境变量 {name} 不是整数: {raw!r}，使用默认值 {default}")
+        return default
+
+DAILY_TOKEN_BUDGET = _get_int_env("DAILY_TOKEN_BUDGET", 15000)
 # ── 安全参数 ──────────────────────────────────────────────────────────────────
 MAX_OUTPUT_TOKENS  = 800    # 单次最大输出 token
 MAX_HISTORY_TURNS  = 6      # 最多保留 6 条历史 (3 轮对话)
-MAX_INPUT_CHARS    = 1500   # prompt 最大字符数 (含搜索结果)
+# 从 .env 的 MAX_INPUT_LEN 读取，未配置则使用默认值。
+MAX_INPUT_CHARS    = _get_int_env("MAX_INPUT_LEN", 1500)
 
 log.info(f"LLM Provider: {ACTIVE_PROVIDER.upper()}")
 
@@ -75,17 +87,22 @@ async def _call_deepseek(prompt: str, history: list, system_prompt: str) -> str:
     messages = [{"role": "system", "content": system_prompt}]
     for h in history[-MAX_HISTORY_TURNS:]:
         role = h.get("role", "user").replace("model", "assistant")
-        messages.append({"role": role, "content": h["parts"][0]})
+        messages.append({"role": role, "content": h.get("content", h.get("parts", [""])[0])})
     messages.append({"role": "user", "content": prompt})
 
     headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
     payload  = {"model": "deepseek-chat", "messages": messages,
                 "max_tokens": MAX_OUTPUT_TOKENS, "temperature": 0.7, "stream": False}
 
+    # 支持通过 PROXY_PORT 设置本地 HTTP 代理（例如 WSL2 + Clash）
+    proxy_port = os.getenv("PROXY_PORT", "").strip()
+    proxy_url = f"http://127.0.0.1:{proxy_port}" if proxy_port else None
+
     async with aiohttp.ClientSession() as s:
         async with s.post("https://api.deepseek.com/chat/completions",
                           headers=headers, json=payload,
-                          timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                          timeout=aiohttp.ClientTimeout(total=30),
+                          proxy=proxy_url) as resp:
             if resp.status == 402:
                 log.error("DeepSeek 余额不足")
                 return "❌ **DeepSeek 余额不足**，请登录 platform.deepseek.com 充值。"
@@ -108,6 +125,12 @@ async def _call_gemini(prompt: str, history: list, system_prompt: str) -> str:
         from google.genai import types
     except ImportError:
         return "❌ 请执行 `pip install google-genai`。"
+    # 支持通过 PROXY_PORT 设置本地 HTTP 代理（例如 WSL2 + Clash）
+    proxy_port = os.getenv("PROXY_PORT", "").strip()
+    if proxy_port:
+        os.environ.setdefault("HTTP_PROXY", f"http://127.0.0.1:{proxy_port}")
+        os.environ.setdefault("HTTPS_PROXY", f"http://127.0.0.1:{proxy_port}")
+
     client   = genai.Client(api_key=GEMINI_KEY)
     contents = [
         types.Content(role=h.get("role","user"), parts=[types.Part(text=h["parts"][0])])
@@ -137,9 +160,12 @@ async def _call_gemini(prompt: str, history: list, system_prompt: str) -> str:
 async def call_llm(
     user_query: str,
     search_context: str = "",
-    chat_history: list = [],
+    chat_history: list | None = None,
     system_prompt: str = "",
 ) -> str:
+    # 避免可变默认参数导致跨请求串联历史
+    if chat_history is None:
+        chat_history = []
     # 熔断检查: 日预算超限
     if is_budget_exceeded():
         return "🔴 **今日 API 预算已达上限**, UTC 00:00(北京时间 08:00)自动重置。"
