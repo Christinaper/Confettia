@@ -1,16 +1,22 @@
 # agent.py
 # 决策层：搜索 + RAG + LLM + Memory 压缩
-# 接入关键词提炼，优化 input token 消耗
 
 import asyncio
 import logging
-from db.memory import ConversationMemory, COMPRESS_AFTER, RECENT_KEEP
-from tools.search import web_search, should_search, extract_search_query
-from tools.llm import call_llm
-from tools.prompt_builder import build_system_prompt
-from tools.rag import async_retrieve, is_rag_available
+from pathlib import Path
 
-log    = logging.getLogger("agent")
+from db.memory  import ConversationMemory, COMPRESS_AFTER, RECENT_KEEP
+from db.archive import Archiver
+
+from tools.search         import web_search, should_search, extract_search_query
+from tools.llm            import call_llm
+from tools.prompt_builder import build_system_prompt
+from tools.rag            import async_retrieve, is_rag_available
+
+log = logging.getLogger("agent")
+
+# bot.py 用 `from agent import memory` 的兼容占位
+# guild 隔离后 memory 是动态创建的，这里给一个默认实例避免 ImportError
 memory = ConversationMemory()
 
 
@@ -20,19 +26,21 @@ async def run_agent(
     user_input: str,
     force_search: bool = False,
     force_rag: bool = False,
+    guild_id: str = "",
 ) -> str:
+    # Memory 和 Archive 按 guild_id 隔离（无 guild_id 时用默认路径）
+    mem  = ConversationMemory(guild_id) if guild_id else memory
+    arch = Archiver(Path(f"archive/{guild_id}") if guild_id else Path("archive"))
 
     # Step 1：检查是否需要压缩
-    await _maybe_compress(user_id, channel_id)
+    await _maybe_compress(mem, arch, user_id, channel_id)
 
-    # Step 2：读取历史（已含摘要层）
-    history = memory.get_history(user_id, channel_id)
+    # Step 2：读取历史
+    history = mem.get_history(user_id, channel_id)
 
     # Step 3：并行搜索 + RAG
     need_search = force_search or should_search(user_input)
-    need_rag    = force_rag or (
-        is_rag_available() and _should_use_rag(user_input)
-    )
+    need_rag    = force_rag or (is_rag_available() and _should_use_rag(user_input))
 
     results = await asyncio.gather(
         _run_search(user_input) if need_search else _noop(),
@@ -47,11 +55,12 @@ async def run_agent(
         log.info(f"RAG 命中：{len(rag_context)} 字符")
 
     # Step 4：组装 Prompt
-    user_note     = memory.get_user_note(user_id)
+    user_note     = mem.get_user_note(user_id)
     system_prompt = build_system_prompt(
         user_note=user_note,
         has_search=bool(search_context),
         has_rag=bool(rag_context),
+        guild_id=guild_id,
     )
     combined = _merge_contexts(search_context, rag_context)
 
@@ -63,29 +72,33 @@ async def run_agent(
         system_prompt=system_prompt,
     )
 
-    # Step 6：保存本轮对话
-    memory.save(user_id, channel_id, "user", user_input)
-    memory.save(user_id, channel_id, "assistant", response)
+    # Step 6：保存 + 归档
+    mem.save(user_id, channel_id, "user", user_input)
+    mem.save(user_id, channel_id, "assistant", response)
+    arch.log_message(user_id, channel_id, "user", user_input,
+                     meta={"search": bool(search_context),
+                           "rag": bool(rag_context)})
+    arch.log_message(user_id, channel_id, "assistant", response)
 
     return response
 
 
-async def _maybe_compress(user_id: str, channel_id: str):
-    """
-    超过阈值时自动触发压缩。
-    用 LLM 生成摘要，把旧消息标记为 compressed。
-    """
-    count = memory.count_uncompressed(user_id, channel_id)
+async def _maybe_compress(
+    mem: ConversationMemory,
+    arch: Archiver,
+    user_id: str,
+    channel_id: str,
+):
+    count = mem.count_uncompressed(user_id, channel_id)
     if count < COMPRESS_AFTER:
         return
 
     log.info(f"触发 Memory 压缩：{count} 条未压缩消息")
-    messages = memory.get_uncompressed(user_id, channel_id)
+    messages = mem.get_uncompressed(user_id, channel_id)
 
-    # 构建压缩 prompt
     history_text = "\n".join(
         f"{m['role'].upper()}: {m['content'][:200]}"
-        for m in messages[:-RECENT_KEEP]   # 不压缩最近 N 条
+        for m in messages[:-RECENT_KEEP]
     )
     if not history_text.strip():
         return
@@ -106,7 +119,13 @@ async def _maybe_compress(user_id: str, channel_id: str):
             timeout=20.0,
         )
         ids = [m["id"] for m in messages]
-        memory.compress(user_id, channel_id, summary.strip(), ids)
+        mem.compress(user_id, channel_id, summary.strip(), ids)
+        arch.log_compression(
+            user_id, channel_id,
+            original_messages=messages[:-RECENT_KEEP],
+            summary=summary.strip(),
+            compressed_count=len(ids) - RECENT_KEEP,
+        )
     except Exception as e:
         log.warning(f"Memory 压缩失败（跳过）：{e}")
 
@@ -136,8 +155,7 @@ def _should_use_rag(user_input: str) -> bool:
         "根据我", "你知道我", "我学过", "我看过", "我研究",
         "my notes", "i wrote", "i mentioned",
     ]
-    lower = user_input.lower()
-    return any(t in lower for t in triggers)
+    return any(t in user_input.lower() for t in triggers)
 
 
 def _merge_contexts(search: str, rag: str) -> str:

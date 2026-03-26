@@ -1,12 +1,16 @@
 # tools/scheduler.py
 # 定时任务：RSS 智能推送 + 每日早报 + Memo 周报
 
+# [改动] 频道配置从 .env 迁移到 guilds/{id}/config.json
+# 所有推送任务改为遍历所有已初始化的 guild，不再读取全局环境变量
+
 import logging
 import os
 from datetime import datetime, timezone, timedelta
 
 log = logging.getLogger("scheduler")
 
+# [保留] 全局默认值，guild config 里可以覆盖
 DAILY_HOUR_UTC = int(os.getenv("DAILY_HOUR_UTC", "1"))
 
 
@@ -23,27 +27,49 @@ def _now_bj() -> str:
     return bj.strftime("%m/%d %H:%M")
 
 
-def _get_rss_channel(bot):
+def _get_rss_channels_per_guild(bot) -> list[tuple]:
     """
-    获取 RSS 推送目标频道。
-    优先使用 RSS_CHANNELS（第一个），不存在则返回 None。
-    统一入口，避免 DIGEST_CHANNEL_ID 和 RSS_CHANNELS 双轨并存。
+    遍历所有已初始化的 guild, 返回 [(guild_id, channel), ...] 列表。
+    只返回配置了 rss 频道且 initialized=True 的 guild。
     """
-    raw = os.getenv("RSS_CHANNELS", "")
-    ids = [s.strip() for s in raw.split(",") if s.strip()]
-    if not ids:
-        log.warning("未配置 RSS_CHANNELS，RSS 推送无目标频道")
-        return None
-    channel = bot.get_channel(int(ids[0]))
-    if not channel:
-        log.warning(f"RSS_CHANNELS 第一个频道 {ids[0]} 未找到（Bot 未缓存或 ID 有误）")
-    return channel
+    from db.guild_config import GUILDS_DIR, get_config
 
+    result = []
+    if not GUILDS_DIR.exists():
+        log.warning("guilds/ 目录不存在，请先运行 python setup_guild.py")
+        return result
 
+    for guild_dir in GUILDS_DIR.iterdir():
+        if not guild_dir.is_dir():
+            continue
+        guild_id = guild_dir.name
+        cfg = get_config(guild_id)
+
+        # 跳过未完成 /setup 的 guild
+        if not cfg.get("initialized"):
+            log.debug(f"Guild {guild_id} 未初始化，跳过")
+            continue
+
+        rss_ids = cfg["channels"].get("rss", [])
+        if not rss_ids:
+            log.debug(f"Guild {guild_id} 未配置 rss 频道，跳过")
+            continue
+
+        channel = bot.get_channel(int(rss_ids[0]))
+        if not channel:
+            log.warning(f"Guild {guild_id} RSS 频道 {rss_ids[0]} 未找到"
+                        f"(Bot 未缓存或 ID 有误)")
+            continue
+
+        result.append((guild_id, channel))
+
+    return result
+
+# 发送工具函数
 async def _send_to_channel(channel, text: str) -> bool:
     """发送消息到指定频道对象，返回是否成功。"""
     if not channel:
-        log.warning(f"找不到频道 {channel_id}，可能 Bot 尚未缓存")
+        log.warning("找不到频道，可能 Bot 尚未缓存")
         return False
     try:
         for chunk in _split_message(text):
@@ -147,84 +173,71 @@ async def _score_items(items: list[dict], call_llm_fn) -> list[dict]:
 # ── RSS 检查任务 ──────────────────────────────────────────────────────────────
 async def _rss_check_job(bot, call_llm_fn) -> str:
     """
-    返回值供 /digest 命令显示状态：
-    'no_new'   → 无新内容
-    'ok:N'     → 成功推送 N 条
-    'error:msg'→ 推送失败
+    遍历所有 guild, 分别检查和推送 RSS。
+
+    返回值供 /digest 命令显示状态
+    'no_guilds'              → 无已配置的 guild
+    'no_new'                 → 所有 guild 均无新内容
+    '{id}:ok:N|{id}:no_new'  → 各 guild 结果用 | 分隔
     """
     from tools.rss import fetch_all_feeds, mark_items_seen, format_digest
 
-    channel = _get_rss_channel(bot)
-    if not channel:
-        return "error:未配置 RSS_CHANNELS 或频道未找到"
+    guild_channels = _get_rss_channels_per_guild(bot)
+    if not guild_channels:
+        log.info("RSS Check: 无已配置的guild")
+        return "no_guilds"
 
-    items = await fetch_all_feeds()
-    if not items:
-        log.info("RSS 检查：无新内容")
-        return "no_new"
+    results = []
+    for guild_id, channel in guild_chanels:
+        # 每个 guild 独立拉取（将来可以 per-guild 配置不同的 feeds）
+        items = await fetch_all_feeds()
+        if not items:
+            log.info(f"RSS Check[{guild_id}]: 无新内容")
+            results.append(f"{guild_id}:no_new")
+            continue
+            
+        log.info(f"RSS Check[{guild_id}]:{len(items)} 条新内容，开始评分过滤")
 
-    log.info(f"RSS 检查：{len(items)} 条新内容，开始评分过滤")
+        # 智能过滤
+        items = await _score_items(items, call_llm_fn)
+        if not items:
+            results.append(f"{guild_id}:filtered")
+            continue
 
-    # 智能过滤
-    items = await _score_items(items, call_llm_fn)
-    if not items:
-        log.info("RSS 检查：评分后无值得推送的内容")
-        return "no_new"
-
-    # LLM 一句话点评
-    summary = ""
-    try:
-        titles  = "、".join(i["title"] for i in items[:5])
-        summary = await call_llm_fn(
-            user_query=f"用一句话（20字以内）点评这些 AI 新闻的整体趋势：{titles}",
-            system_prompt="只输出一句话，不超过20字，语气活泼，不加前缀。",
-        )
-        summary = summary.strip().replace("\n", "")
-    except Exception as e:
-        log.warning(f"RSS 摘要生成失败：{e}")
-
-    # 时间戳用北京时间，和频道里看到的一致
-    now_str = _now_bj()
-    message = format_digest(items, summary, now_str)
-
-    ok = await _send_to_channel(channel, message)
-    if not ok:
-        return "error:消息发送失败"
-
-    # 同步发到论坛频道（每篇文章一个独立帖子）
-    forum_raw = os.getenv("FORUM_CHANNELS", "")
-    if forum_raw:
-        # 延迟导入避免循环
-        from bot import post_to_forum
-        for item in items:
-            body = (
-                f"**来源：** {item['tag']}\n"
-                f"**链接：** {item['url']}\n\n"
-                f"{item.get('summary', '')}"
+        # LLM 一句话点评
+        summary = ""
+        try:
+            titles  = "、".join(i["title"] for i in items[:5])
+            summary = await call_llm_fn(
+                user_query=f"用一句话（20字以内）点评这些 AI 新闻的整体趋势：{titles}",
+                system_prompt="只输出一句话，不超过20字，语气活泼，不加前缀。",
             )
-            await post_to_forum(
-                title=item["title"][:100],
-                content=body,
-                tags=["AI", item["feed_name"][:20]],
-            )
+            summary = summary.strip().replace("\n", "")
+        except Exception as e:
+            log.warning(f"RSS 摘要生成失败[{guild_id}]: {e}")
 
-    mark_items_seen(items)
-    log.info(f"RSS 推送完成：{len(items)} 条 → #{channel.name}")
-    return f"ok:{len(items)}"
+        message = format_digest(items, summary, _now_bj())
 
+        ok = await _send_to_channel(channel, message)
+        if ok:
+            mark_items_seen(items)
+            log.info(f"RSS 推送完成 [{guild_id}]:{len(items)} 条 → #{channel.name}")
+            results.append(f"{guild_id}:ok:{len(items)}")
+        else:
+            results.append(f"{guild_id}:error")
+    
+    return "|".join(results) if results else "no_new"
 
 # ── 每日早报任务 ──────────────────────────────────────────────────────────────
 async def _daily_digest_job(bot, call_llm_fn) -> str:
     from tools.rss import fetch_all_feeds, mark_items_seen, format_digest
     from tools.search import web_search
 
-    channel = _get_rss_channel(bot)
-    if not channel:
-        return "error:未配置 RSS_CHANNELS 或频道未找到"
+    guild_channels = _get_rss_channels_per_guild(bot)
+    if not guild_channels:
+        return "no_guilds"
 
-    rss_items = await fetch_all_feeds()
-
-    # 搜索补充（失败不阻塞）
+    # 搜索补充（所有 guild 共用，只搜一次）
     search_results = ""
     try:
         search_results = await web_search("AI LLM 最新动态 今日")
@@ -232,6 +245,7 @@ async def _daily_digest_job(bot, call_llm_fn) -> str:
         log.warning(f"早报搜索失败：{e}")
 
     # LLM 生成早报摘要
+    rss_items = await fetch_all_feeds()
     rss_titles = "\n".join(f"- {i['title']}" for i in rss_items[:5])
     prompt = (
         f"今日 AI 资讯早报，请用 3 条要点总结（每条不超过 40 字）：\n\n"
@@ -263,12 +277,17 @@ async def _daily_digest_job(bot, call_llm_fn) -> str:
         full_msg += f"\n\n{format_digest(rss_items[:3], '', now_str)}"
         mark_items_seen(rss_items)
 
-    ok = await _send_to_channel(channel, full_msg)
-    if not ok:
-        return "error:消息发送失败"
+    # [改动] 遍历所有 guild 发送，而不是单一频道
+    results = []
+    for guild_id, channel in guild_channels:
+        ok = await _send_to_channel(channel, full_msg)
+        if ok:
+            log.info(f"每日早报已推送[{guild_id}] → #{channel.name}")
+            results.append(f"{guild_id}:ok")
+        else:
+            results.append(f"{guild_id}:error")
 
-    log.info(f"每日早报已推送 → #{channel.name}")
-    return "ok:daily"
+    return "|".join(results) if results else "error:无频道可推送"
 
 
 # ── Memo 周报任务 ─────────────────────────────────────────────────────────────
@@ -290,7 +309,10 @@ async def _memo_weekly_job(bot, call_llm_fn) -> str:
     all_text = "\n".join(f"- {i['content']}" for i in items)
     try:
         summary = await call_llm_fn(
-            user_query=f"以下是我这周随手记的想法，用一句话（30字以内）概括主题趋势：\n{all_text}",
+            user_query=(
+                f"以下是我这周随手记的想法，"
+                f"用一句话（30字以内）概括主题趋势：\n{all_text}"
+            ),
             system_prompt="只输出一句话总结，不加任何前缀。",
         )
         summary = summary.strip()
@@ -299,10 +321,19 @@ async def _memo_weekly_job(bot, call_llm_fn) -> str:
 
     message = format_weekly_digest(owner_id, summary, items)
 
-    # Memo 周报发到 CHAT_CHANNELS 第一个
-    chat_raw = os.getenv("CHAT_CHANNELS", "")
-    chat_ids = [s.strip() for s in chat_raw.split(",") if s.strip()]
+    # 从 guild config 读 chat 频道，替代 os.getenv("CHAT_CHANNELS")
+    from db.guild_config import GUILDS_DIR, get_config
+    chat_ids = []
+    if GUILDS_DIR.exists():
+        for guild_dir in GUILDS_DIR.iterdir():
+            if guild_dir.is_dir():
+                cfg = get_config(guild_dir.name)
+                if cfg.get("initialized"):
+                    chat_ids.extend(cfg["channels"].get("chat", []))
 
+    if not chat_ids:
+        return "error:无已配置的 chat 频道"
+        
     for chan_id in chat_ids:
         try:
             channel = bot.get_channel(int(chan_id))

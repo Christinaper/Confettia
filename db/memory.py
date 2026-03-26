@@ -15,10 +15,16 @@ COMPRESS_AFTER = 20   # 超过 N 条时触发压缩
 
 
 class ConversationMemory:
-    def __init__(self, db_path: str = "agent_memory.db"):
-        self.db_path = db_path
+    def __init__(self, guild_id: str = ""):
+        from db.guild_config import db_path, bootstrap
+        if guild_id:
+            bootstrap(guild_id)
+            self.db_path = db_path(guild_id)
+        else:
+            # 兼容模式：未传 guild_id 时用旧路径（迁移过渡期使用）
+            self.db_path = "agent_memory.bd"
         # 线程锁: 防止多用户同时操作数据库时发生冲突
-        self.lock = threading.Lock()
+        self.lock        = threading.Lock()
         self._init_db()
 
     def _get_conn(self):

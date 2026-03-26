@@ -33,58 +33,45 @@ log = logging.getLogger("bot")
 # ── 代理 ──────────────────────────────────────────────────────────────────────
 PROXY = os.getenv("PROXY", "")
 
-# ── 安全参数（可通过 .env 调整）──────────────────────────────────────────────
-MAX_INPUT_LEN    = int(os.getenv("MAX_INPUT_LEN",    "500"))   # 单条消息最大字符
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))    # 用户冷却秒数
-COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))     # 冷却窗口内最大次数
-GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))    # 全局每分钟最大请求数
+# ── 安全参数 ──────────────────────────────────────────────────────────────────
+MAX_INPUT_LEN    = int(os.getenv("MAX_INPUT_LEN",    "500"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
+COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))
+GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))
 
 # ── 频道角色配置 ──────────────────────────────────────────────────────────────
-# 每个频道 ID 只能属于一个角色，角色决定 Bot 的行为。
-# 一个角色可以有多个频道 ID（逗号分隔），但推送类任务只发到第一个。
+# 频道角色现在从 guilds/{guild_id}/config.json 读取，不再从 .env 读取。
+# 每个服务器独立配置，运行 python setup_guild.py 完成初始化。
 #
 # 角色定义：
-#   CHAT_CHANNELS    独聊：无需 @，无 quote，自由对话（猫娘）
-#   RSS_CHANNELS     推送：接收 RSS 定时推送和每日早报，忽略用户消息
-#                    ⚠️  推送任务只发到第一个 ID，多个 ID 仅作路由识别用
-#   LOG_CHANNELS     日志：Bot 状态通知（启动/告警），忽略用户消息
-#                    ⚠️  所有 LOG_CHANNELS 都会收到通知（广播模式）
-#   TOPIC_CHANNELS   话题：含 URL 自动展开总结
-#   MEMO_CHANNELS    备忘：存储碎片想法，加 reaction 不回复
-#   REVIEW_CHANNELS  评审：代码/长文自动点评
-#
-# 多频道防重复规则：
-#   - 对话类（CHAT/TOPIC/MEMO/REVIEW）：每条消息只在触发频道内响应，不跨频道
-#   - 推送类（RSS）：只推到 RSS_CHANNELS 第一个频道
-#   - 日志类（LOG）：广播到所有 LOG_CHANNELS（通常只配一个）
-#
-# 一个频道 ID 出现在多个角色里时，优先级：
-#   chat > rss > log > topic > memo > review > mention（默认）
+#   chat    独聊：无需 @，无 quote，自由对话
+#   rss     推送：接收定时推送，忽略用户消息
+#   log     日志：Bot 状态通知，忽略用户消息
+#   topic   话题：含 URL 自动展开总结
+#   memo    备忘：静默存储想法，加 reaction
+#   review  评审：代码/长文自动点评
+#   forum   论坛：每条 RSS 开独立帖子
+#   mention 默认：必须 @ 才响应
 
-def _parse_channels(env_key: str) -> set[str]:
-    raw = os.getenv(env_key, "")
-    return {s.strip() for s in raw.split(",") if s.strip()}
+from db.guild_config import (
+    bootstrap as _guild_bootstrap,
+    get_channel_role as _guild_get_role,
+    get_config as _guild_get_config,
+    get_soul as _guild_get_soul,
+    guild_dir as _guild_dir,
+)
 
-CHAT_CHANNELS   = _parse_channels("CHAT_CHANNELS")
-RSS_CHANNELS    = _parse_channels("RSS_CHANNELS")
-LOG_CHANNELS    = _parse_channels("LOG_CHANNELS")
-TOPIC_CHANNELS  = _parse_channels("TOPIC_CHANNELS")
-MEMO_CHANNELS   = _parse_channels("MEMO_CHANNELS")
-REVIEW_CHANNELS = _parse_channels("REVIEW_CHANNELS")
-FORUM_CHANNELS  = _parse_channels("FORUM_CHANNELS")   # 论坛频道：每条 RSS 开独立帖子
+def get_channel_role(guild_id: str, chan_id: str) -> str:
+    """从该服务器的 config.json 读取频道角色。"""
+    return _guild_get_role(guild_id, chan_id)
 
-# 兼容旧配置
-CHAT_CHANNELS |= _parse_channels("SOLO_CHANNEL_IDS")
+def _get_log_channels(guild_id: str) -> list[str]:
+    """获取该服务器的 log 频道列表。"""
+    return _guild_get_config(guild_id).get("channels", {}).get("log", [])
 
-def get_channel_role(chan_id: str) -> str:
-    if chan_id in CHAT_CHANNELS:   return "chat"
-    if chan_id in RSS_CHANNELS:    return "rss"
-    if chan_id in LOG_CHANNELS:    return "log"
-    if chan_id in TOPIC_CHANNELS:  return "topic"
-    if chan_id in MEMO_CHANNELS:   return "memo"
-    if chan_id in REVIEW_CHANNELS: return "review"
-    if chan_id in FORUM_CHANNELS:  return "forum"
-    return "mention"
+def _get_forum_channels(guild_id: str) -> list[str]:
+    """获取该服务器的 forum 频道列表。"""
+    return _guild_get_config(guild_id).get("channels", {}).get("forum", [])
 
 # ── Bot 初始化 ────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -172,27 +159,17 @@ async def on_ready():
     if PROXY:
         log.info(f"   代理：{PROXY}")
     try:
-        await bot.wait_until_ready()
-        total = 0
-        for guild in bot.guilds:
-            synced = await bot.tree.sync(guild=guild)
-            total += len(synced)
-            log.info(f"   Guild [{guild.name}] 同步：{len(synced)} 个命令")
-            
-        log.info(f"   Slash 命令同步：{len(synced)} 个（Guild 级别，立即生效）")
-        # log.info(f"   Slash 命令同步：{len(synced)} 个")
+        synced = await bot.tree.sync()
+        log.info(f"   Slash 命令同步：{len(synced)} 个")
     except Exception as e:
         log.error(f"   Slash 命令同步失败：{e}")
-        await log_to_channel(f"⚠️ **Slash 命令同步失败**\n```{e}```")
     if not health_check.is_running():
         health_check.start()
     setup_scheduler(bot, call_llm)
     # 启动通知
     await log_to_channel(
         f"✅ **Confettia 上线** `{discord.utils.utcnow().strftime('%m/%d %H:%M UTC')}`\n"
-        f"服务器：{len(bot.guilds)} 个｜Slash 命令：{len(synced)} 个已同步"
-        # f"✅ **Confettia 上线** `{discord.utils.utcnow().strftime('%m/%d %H:%M UTC')}`\n"
-        # f"服务器：{len(bot.guilds)} 个｜Slash 命令：已同步"
+        f"服务器：{len(bot.guilds)} 个｜Slash 命令：已同步"
     )
 
 
@@ -263,10 +240,21 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    chan_id  = str(message.channel.id)
-    user_id  = str(message.author.id)
-    role     = get_channel_role(chan_id)
+    # DM 没有 guild，跳过
+    if not message.guild:
+        return
+
+    guild_id  = str(message.guild.id)
+    chan_id   = str(message.channel.id)
+    user_id   = str(message.author.id)
     mentioned = bot.user in message.mentions
+
+    # 懒加载初始化（幂等，失败则静默跳过）
+    if not _guild_bootstrap(guild_id):
+        log.warning(f"Guild {guild_id} 初始化失败，跳过消息")
+        return
+
+    role = get_channel_role(guild_id, chan_id)
 
     # ── 按频道角色路由 ────────────────────────────────────────────────────────
 
@@ -281,7 +269,7 @@ async def on_message(message: discord.Message):
 
     # REVIEW 频道：代码/长文自动点评
     if role == "review":
-        await _handle_review(message, user_id, chan_id)
+        await _handle_review(message, user_id, chan_id, guild_id)
         return
 
     # TOPIC 频道：检测 URL，自动展开总结
@@ -289,19 +277,19 @@ async def on_message(message: discord.Message):
         has_url = "http://" in message.content or "https://" in message.content
         if not has_url and not mentioned:
             return
-        await _handle_topic(message, user_id, chan_id)
+        await _handle_topic(message, user_id, chan_id, guild_id)
         return
 
     # CHAT 频道：无需 @，直接对话
     if role == "chat":
-        await _handle_chat(message, user_id, chan_id, quote=False)
+        await _handle_chat(message, user_id, chan_id, guild_id, quote=False)
         return
 
     # 默认（mention）：必须 @
     if not mentioned:
         await bot.process_commands(message)
         return
-    await _handle_chat(message, user_id, chan_id, quote=True)
+    await _handle_chat(message, user_id, chan_id, guild_id, quote=True)
     await bot.process_commands(message)
 
 
@@ -318,9 +306,11 @@ async def _handle_chat(
     message: discord.Message,
     user_id: str,
     chan_id: str,
+    guild_id: str,
     quote: bool,
 ):
     """chat / mention 频道的通用对话处理。"""
+    guild_id = str(message.guild.id) if message.guild else ""
     lock_key = f"{user_id}:{chan_id}"
 
     if is_budget_exceeded():
@@ -353,7 +343,7 @@ async def _handle_chat(
     try:
         async with message.channel.typing():
             response = await asyncio.wait_for(
-                run_agent(user_id, chan_id, user_input),
+                run_agent(user_id, chan_id, user_input, guild_id=guild_id),
                 timeout=45.0,
             )
         global _error_count
@@ -420,11 +410,17 @@ async def post_to_forum(title: str, content: str, tags: list[str] = None):
 
 
 # ── Log 频道通知 ──────────────────────────────────────────────────────────────
-async def log_to_channel(text: str):
-    """向所有 LOG_CHANNELS 发送一条通知，失败静默。"""
-    if not LOG_CHANNELS:
-        return
-    for chan_id in LOG_CHANNELS:
+async def log_to_channel(text: str, guild_id: str = ""):
+    """向该服务器的所有 LOG 频道发送通知，失败静默。"""
+    if guild_id:
+        log_ids = _get_log_channels(guild_id)
+    else:
+        # 广播到所有已知服务器的 log 频道
+        log_ids = []
+        for guild in bot.guilds:
+            log_ids.extend(_get_log_channels(str(guild.id)))
+
+    for chan_id in log_ids:
         try:
             channel = bot.get_channel(int(chan_id))
             if channel:
@@ -463,6 +459,12 @@ async def _handle_review(message: discord.Message, user_id: str, chan_id: str):
     if not triggered:
         return
 
+async def _handle_review(message: discord.Message, user_id: str,
+                         chan_id: str, guild_id: str):
+    triggered, review_type = should_review(message.content)
+    if not triggered:
+        return
+
     lock_key = f"{user_id}:{chan_id}"
     if lock_key in _processing:
         await message.add_reaction("⏳")
@@ -480,10 +482,10 @@ async def _handle_review(message: discord.Message, user_id: str, chan_id: str):
         await message.add_reaction(icon)
         async with message.channel.typing():
             response = await asyncio.wait_for(
-                run_agent(user_id, chan_id, prompt, force_search=False),
+                run_agent(user_id, chan_id, prompt,
+                          force_search=False, guild_id=guild_id),
                 timeout=45.0,
             )
-        # review 频道不 quote，直接发，界面更干净
         await send_long_message(message, response, quote=False)
     except asyncio.TimeoutError:
         await message.channel.send("⏱️ Review 超时，请稍后重试。")
@@ -495,22 +497,18 @@ async def _handle_review(message: discord.Message, user_id: str, chan_id: str):
 
 
 # ── Topic 频道：URL 自动展开 ──────────────────────────────────────────────────
-async def _handle_topic(message: discord.Message, user_id: str, chan_id: str):
-    """
-    检测消息里的 URL，抓取页面标题 + 摘要，
-    让 LLM 总结并提出 3 个延伸问题。
-    """
+async def _handle_topic(message: discord.Message, user_id: str,
+                        chan_id: str, guild_id: str):
     import re
-    urls = re.findall(r"https?://\S+", message.content)
+    urls      = re.findall(r"https?://\S+", message.content)
     user_text = re.sub(r"https?://\S+", "", message.content).strip()
     user_text = user_text.replace(f"<@{bot.user.id}>", "").strip()
 
     if not urls:
-        # 没有 URL 但有 @，当普通对话处理
-        await _handle_chat(message, user_id, chan_id, quote=True)
+        await _handle_chat(message, user_id, chan_id, guild_id, quote=True)
         return
 
-    url = urls[0]   # 只处理第一个 URL
+    url    = urls[0]
     prompt = (
         f"请帮我总结以下链接的内容，并提出 3 个值得深入思考的延伸问题。\n\n"
         f"链接：{url}\n"
@@ -526,12 +524,11 @@ async def _handle_topic(message: discord.Message, user_id: str, chan_id: str):
     try:
         async with message.channel.typing():
             response = await asyncio.wait_for(
-                run_agent(user_id, chan_id, prompt, force_search=False),
+                run_agent(user_id, chan_id, prompt,
+                          force_search=False, guild_id=guild_id),
                 timeout=45.0,
             )
         await send_long_message(message, response, quote=False)
-    except asyncio.TimeoutError:
-        await message.channel.send("⏱️ 链接处理超时，请稍后重试。")
     except Exception as e:
         log.error(f"topic 处理失败：{e}", exc_info=True)
     finally:
@@ -562,7 +559,9 @@ async def slash_search(interaction: discord.Interaction, query: str):
     await interaction.response.defer(thinking=True)
     try:
         response = await asyncio.wait_for(
-            run_agent(user_id, str(interaction.channel_id), clean_query, force_search=True),
+            run_agent(user_id, str(interaction.channel_id), clean_query,
+                      force_search=True,
+                      guild_id=str(interaction.guild.id) if interaction.guild else ""),
             timeout=30.0,
         )
         await send_slash_response(interaction, response)
@@ -657,6 +656,84 @@ async def slash_digest(
         await interaction.followup.send(f"❌ 执行失败：{e}", ephemeral=True)
 
 
+# ── Slash：/profile（用户个性化配置）─────────────────────────────────────────
+profile_group = app_commands.Group(name="profile", description="👤 用户个性化配置")
+
+@profile_group.command(name="show", description="查看你的当前配置")
+async def profile_show(interaction: discord.Interaction):
+    from db.profiles import profiles
+    summary = profiles.summary(str(interaction.user.id))
+    await interaction.response.send_message(
+        f"**你的配置**\n{summary}", ephemeral=True
+    )
+
+@profile_group.command(name="soul", description="设置专属人格（追加在全局设定之后）")
+@app_commands.describe(instruction="额外的人格指令，例如：请用更正式的语气回复我")
+async def profile_soul(interaction: discord.Interaction, instruction: str):
+    from db.profiles import profiles
+    profiles.set(str(interaction.user.id), soul_override=instruction)
+    await interaction.response.send_message(
+        f"✅ 人格覆盖已设置：`{instruction[:50]}`", ephemeral=True
+    )
+
+@profile_group.command(name="language", description="设置回复语言偏好")
+@app_commands.describe(lang="语言代码：zh 中文、en 英文、ja 日文")
+async def profile_language(interaction: discord.Interaction, lang: str):
+    from db.profiles import profiles
+    profiles.set(str(interaction.user.id), language=lang)
+    await interaction.response.send_message(
+        f"✅ 语言已设置：`{lang}`", ephemeral=True
+    )
+
+@profile_group.command(name="reset", description="重置所有个人配置为默认")
+async def profile_reset(interaction: discord.Interaction):
+    from db.profiles import profiles
+    profiles.reset(str(interaction.user.id))
+    await interaction.response.send_message("✅ 配置已重置为默认。", ephemeral=True)
+
+bot.tree.add_command(profile_group)
+
+
+# ── Slash：/admin（仅主人）───────────────────────────────────────────────────
+admin_group = app_commands.Group(name="admin", description="🔧 管理员：用户配置管理")
+
+@admin_group.command(name="set-feature", description="开关某用户的功能权限")
+@app_commands.describe(
+    user="目标用户",
+    feature="功能名：search / memo / review",
+    enabled="True=开启 False=关闭",
+)
+async def admin_set_feature(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    feature: str,
+    enabled: bool,
+):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ 仅 Bot 主人可用。", ephemeral=True)
+        return
+    from db.profiles import profiles
+    profiles.set(str(user.id), features={feature: enabled})
+    await interaction.response.send_message(
+        f"✅ 已将 `{user.display_name}` 的 `{feature}` 功能{'开启' if enabled else '关闭'}。",
+        ephemeral=True,
+    )
+
+@admin_group.command(name="view", description="查看某用户的配置")
+@app_commands.describe(user="目标用户")
+async def admin_view(interaction: discord.Interaction, user: discord.Member):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ 仅 Bot 主人可用。", ephemeral=True)
+        return
+    from db.profiles import profiles
+    summary = profiles.summary(str(user.id))
+    await interaction.response.send_message(
+        f"**{user.display_name} 的配置**\n{summary}", ephemeral=True
+    )
+
+bot.tree.add_command(admin_group)
+
+
 # ── Slash：/forum-test（论坛频道测试，仅主人）─────────────────────────────────
 @bot.tree.command(name="forum-test", description="🧵 向论坛频道发一条测试帖（仅主人）")
 async def slash_forum_test(interaction: discord.Interaction):
@@ -742,7 +819,7 @@ async def slash_clear(interaction: discord.Interaction):
 @bot.tree.command(name="status", description="📊 查看 Bot 运行状态和今日用量")
 async def slash_status(interaction: discord.Interaction):
     u = get_usage_summary()
-    msg_count = memory.count(str(interaction.user.id), str(interaction.channel_id))
+    msg_count = memory.count_uncompressed(str(interaction.user.id), str(interaction.channel_id))
 
     # 预算进度条（10 格）
     filled = round(u["pct"] / 10)
@@ -770,7 +847,10 @@ async def slash_status(interaction: discord.Interaction):
 # ── 辅助：发送消息（统一处理 quote 逻辑）────────────────────────────────────
 async def _send(message: discord.Message, text: str, delete_after: float = None):
     """chat 频道用 channel.send，其他用 reply。"""
-    if get_channel_role(str(message.channel.id)) == "chat":
+    if get_channel_role(
+        str(message.guild.id) if message.guild else "",
+        str(message.channel.id)
+    ) == "chat":
         await message.channel.send(text, delete_after=delete_after)
     else:
         await message.reply(text, delete_after=delete_after)
