@@ -20,3 +20,7 @@ Thumbs.db
 
 # Doc
 doc/
+
+guilds/*/data.db
+guilds/*/data.db-wal
+guilds/*/data.db-shm
