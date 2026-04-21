@@ -22,7 +22,7 @@ class ConversationMemory:
             self.db_path = db_path(guild_id)
         else:
             # 兼容模式：未传 guild_id 时用旧路径（迁移过渡期使用）
-            self.db_path = "agent_memory.bd"
+            self.db_path = "agent_memory.db"
         # 线程锁: 防止多用户同时操作数据库时发生冲突
         self.lock        = threading.Lock()
         self._init_db()
