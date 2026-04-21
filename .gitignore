@@ -1,5 +1,7 @@
 # 密钥（最重要）
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -10,6 +12,11 @@ venv/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+*.db.backup*
+
+# Codex
+.codex
 
 # 系统文件
 .DS_Store

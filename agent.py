@@ -11,7 +11,16 @@ from db.archive import Archiver
 from tools.search         import web_search, should_search, extract_search_query
 from tools.llm            import call_llm
 from tools.prompt_builder import build_system_prompt
-from tools.rag            import async_retrieve, is_rag_available
+
+# RAG 是可选能力：在低配 VPS / 未安装依赖的情况下也应能正常启动。
+try:
+    from tools.rag import async_retrieve, is_rag_available
+except Exception:
+    async def async_retrieve(*_args, **_kwargs) -> str:  # type: ignore[no-redef]
+        return ""
+
+    def is_rag_available() -> bool:  # type: ignore[no-redef]
+        return False
 
 log = logging.getLogger("agent")
 

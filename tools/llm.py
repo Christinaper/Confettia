@@ -15,6 +15,21 @@ log = logging.getLogger("llm")
 DEEPSEEK_KEY       = os.getenv("DEEPSEEK_API_KEY", "")
 GEMINI_KEY         = os.getenv("GEMINI_API_KEY", "")
 ACTIVE_PROVIDER    = "deepseek" if DEEPSEEK_KEY else ("gemini" if GEMINI_KEY else "none")
+
+def _get_proxy_url() -> str | None:
+    """
+    可选 HTTP 代理。
+    - 优先用 PROXY（完整 URL，例如 http://127.0.0.1:7897）
+    - 兼容旧的 PROXY_PORT（仅端口，默认 127.0.0.1）
+    """
+    proxy = os.getenv("PROXY", "").strip()
+    if proxy:
+        return proxy
+    proxy_port = os.getenv("PROXY_PORT", "").strip()
+    if proxy_port:
+        return f"http://127.0.0.1:{proxy_port}"
+    return None
+
 def _get_int_env(name: str, default: int) -> int:
     """读取 int 环境变量，失败时返回默认值并记录警告。"""
     raw = os.getenv(name, "")
@@ -94,9 +109,7 @@ async def _call_deepseek(prompt: str, history: list, system_prompt: str) -> str:
     payload  = {"model": "deepseek-chat", "messages": messages,
                 "max_tokens": MAX_OUTPUT_TOKENS, "temperature": 0.7, "stream": False}
 
-    # 支持通过 PROXY_PORT 设置本地 HTTP 代理（例如 WSL2 + Clash）
-    proxy_port = os.getenv("PROXY_PORT", "").strip()
-    proxy_url = f"http://127.0.0.1:{proxy_port}" if proxy_port else None
+    proxy_url = _get_proxy_url()
 
     async with aiohttp.ClientSession() as s:
         async with s.post("https://api.deepseek.com/chat/completions",
@@ -125,11 +138,10 @@ async def _call_gemini(prompt: str, history: list, system_prompt: str) -> str:
         from google.genai import types
     except ImportError:
         return "❌ 请执行 `pip install google-genai`。"
-    # 支持通过 PROXY_PORT 设置本地 HTTP 代理（例如 WSL2 + Clash）
-    proxy_port = os.getenv("PROXY_PORT", "").strip()
-    if proxy_port:
-        os.environ.setdefault("HTTP_PROXY", f"http://127.0.0.1:{proxy_port}")
-        os.environ.setdefault("HTTPS_PROXY", f"http://127.0.0.1:{proxy_port}")
+    proxy_url = _get_proxy_url()
+    if proxy_url:
+        os.environ.setdefault("HTTP_PROXY", proxy_url)
+        os.environ.setdefault("HTTPS_PROXY", proxy_url)
 
     client   = genai.Client(api_key=GEMINI_KEY)
     contents = [

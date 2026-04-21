@@ -1,0 +1,33 @@
+{
+  "channels": {
+    "chat": ["1299042665064829014"],
+    "rss": ["1479894193340944444"],
+    "log": ["1479894565875093624"],
+    "topic": [],
+    "memo": ["1480942784880840795"],
+    "review": [],
+    "forum": ["1480928796474474516"]
+  },
+  "rss_feeds": [
+    {
+      "name": "Anthropic Blog",
+      "url": "https://www.anthropic.com/rss.xml"
+    },
+    {
+      "name": "The Verge AI",
+      "url": "https://www.theverge.com/ai-artificial-intelligence/rss/index.xml"
+    },
+    {
+      "name": "HuggingFace Blog",
+      "url": "https://huggingface.co/blog/feed.xml"
+    },
+    {
+      "name": "OpenAI Blog",
+      "url": "https://openai.com/blog/rss.xml"
+    }
+  ],
+  "token_budget": 15000,
+  "daily_hour_utc": 1,
+  "rag_enabled": false,
+  "initialized": true
+}
