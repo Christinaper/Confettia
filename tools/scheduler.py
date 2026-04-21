@@ -188,7 +188,7 @@ async def _rss_check_job(bot, call_llm_fn) -> str:
         return "no_guilds"
 
     results = []
-    for guild_id, channel in guild_chanels:
+    for guild_id, channel in guild_channels:
         # 每个 guild 独立拉取（将来可以 per-guild 配置不同的 feeds）
         items = await fetch_all_feeds()
         if not items:
