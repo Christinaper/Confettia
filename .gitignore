@@ -21,6 +21,9 @@ Thumbs.db
 # Doc
 doc/
 
+chroma_db/
+archive/
+
 guilds/*/data.db
 guilds/*/data.db-wal
 guilds/*/data.db-shm
