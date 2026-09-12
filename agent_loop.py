@@ -67,8 +67,6 @@ async def _call_deepseek_with_tools(messages: list) -> dict:
         "tools": TOOLS,
         # auto = LLM 自己决定要不要调工具（也可以设 "none" 或 "required"）
         "tool_choice": "auto",
-        # 每次最多调1个工具，防止并行乱搜导致 token 浪费和结果混乱
-        "parallel_tool_calls": False,
         "max_tokens": 800,
         "temperature": 0.7,
     }
@@ -143,20 +141,31 @@ async def run_agent_loop(user_input: str, system_prompt: str = "") -> str:
         # 先把 LLM 的"我要调工具"这条消息追加到历史
         messages.append(assistant_message)
 
-        # 强制只执行第一个工具调用：DeepSeek 忽略 parallel_tool_calls 参数，在代码层截断
-        for tool_call in tool_calls[:1]:  # 代码层强制单工具
+        # DeepSeek 规则：LLM 说调 N 个工具，必须返回 N 个结果，否则 400 错误
+        # 策略：并行执行所有工具（满足 API 要求），但把结果合并后只让 LLM 看一份摘要
+        # 这样既不违反 API 协议，又控制了 LLM 下一轮的输入量
+        all_results = []
+        for tool_call in tool_calls:
             tool_name = tool_call["function"]["name"]
             tool_args = json.loads(tool_call["function"]["arguments"])
             tool_call_id = tool_call["id"]
 
             log.info(f"[Loop] LLM 选择工具: {tool_name}({tool_args})")
             result = await _execute_tool(tool_name, tool_args)
+            all_results.append((tool_call_id, tool_name, result))
 
-            # 把工具结果追加到历史，格式固定（DeepSeek API 要求）
+        # 第一个工具结果放合并摘要，其余工具返回占位符
+        # 原因：DeepSeek 要求每个 tool_call_id 都有对应结果，但实际内容我们控制
+        combined = "\n\n---\n\n".join(
+            f"[{name}({json.loads(tc['function']['arguments']).get('query','')})]\n{res}"
+            for tc, (_, name, res) in zip(tool_calls, all_results)
+            if res
+        )
+        for i, (tool_call_id, tool_name, result) in enumerate(all_results):
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call_id,  # 对应上面的调用 ID
-                "content": result,
+                "tool_call_id": tool_call_id,
+                "content": combined if i == 0 else "[已合并到第一条结果]",
             })
 
         # 继续 loop：带着工具结果再次调 LLM
