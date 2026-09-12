@@ -67,6 +67,8 @@ async def _call_deepseek_with_tools(messages: list) -> dict:
         "tools": TOOLS,
         # auto = LLM 自己决定要不要调工具（也可以设 "none" 或 "required"）
         "tool_choice": "auto",
+        # 每次最多调1个工具，防止并行乱搜导致 token 浪费和结果混乱
+        "parallel_tool_calls": False,
         "max_tokens": 800,
         "temperature": 0.7,
     }
@@ -159,10 +161,32 @@ async def run_agent_loop(user_input: str, system_prompt: str = "") -> str:
 
         # 继续 loop：带着工具结果再次调 LLM
 
-    # 超过最大次数还没结束，强制返回最后一次的内容
-    log.warning(f"[Loop] 达到最大迭代次数 {MAX_ITERATIONS}，强制返回")
-    last = messages[-1].get("content", "处理超时，请重试。")
-    return last if isinstance(last, str) else str(last)
+    # 超过最大次数还没结束：让 LLM 用已有信息总结，不再给工具
+    log.warning(f"[Loop] 达到最大迭代次数 {MAX_ITERATIONS}，触发兜底总结")
+    messages.append({
+        "role": "user",
+        "content": "请根据你已经搜索到的信息，给出最终回答。不要再搜索了。"
+    })
+    fallback_payload = {
+        "model": "deepseek-chat",
+        "messages": messages,
+        # 关键：不传 tools，强制 LLM 直接回答
+        "max_tokens": 800,
+        "temperature": 0.7,
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.deepseek.com/chat/completions",
+            headers=headers,
+            json=fallback_payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            data = await resp.json()
+            return data["choices"][0]["message"].get("content", "信息不足，请换个方式提问。")
 
 
 # ── 命令行测试入口 ─────────────────────────────────────────────────────────────
