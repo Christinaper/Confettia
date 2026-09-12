@@ -143,8 +143,8 @@ async def run_agent_loop(user_input: str, system_prompt: str = "") -> str:
         # 先把 LLM 的"我要调工具"这条消息追加到历史
         messages.append(assistant_message)
 
-        # 执行所有工具调用（通常只有一个，但 API 支持并行多个）
-        for tool_call in tool_calls:
+        # 强制只执行第一个工具调用：DeepSeek 忽略 parallel_tool_calls 参数，在代码层截断
+        for tool_call in tool_calls[:1]:  # 代码层强制单工具
             tool_name = tool_call["function"]["name"]
             tool_args = json.loads(tool_call["function"]["arguments"])
             tool_call_id = tool_call["id"]
