@@ -39,6 +39,14 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
 COOLDOWN_MAX     = int(os.getenv("COOLDOWN_MAX",     "2"))
 GLOBAL_MAX_RPM   = int(os.getenv("GLOBAL_MAX_RPM",   "20"))
 
+# ── 访问控制（白名单）────────────────────────────────────────────────────────
+# 逗号分隔的 guild id，留空表示不限制（仅个人调试用）
+_raw_guilds = os.getenv("ALLOWED_GUILD_IDS", "").strip()
+ALLOWED_GUILD_IDS: set[str] = (
+    {g.strip() for g in _raw_guilds.split(",") if g.strip()}
+    if _raw_guilds else set()
+)
+
 # ── 频道角色配置 ──────────────────────────────────────────────────────────────
 # 频道角色现在从 guilds/{guild_id}/config.json 读取，不再从 .env 读取。
 # 每个服务器独立配置，运行 python setup_guild.py 完成初始化。
@@ -172,6 +180,20 @@ async def on_ready():
         f"服务器：{len(bot.guilds)} 个｜Slash 命令：已同步"
     )
 
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """
+    Bot 被拉入新服务器时触发。
+    非白名单服务器：记录警告并立即退出。
+    白名单服务器：正常 bootstrap 初始化。
+    """
+    gid = str(guild.id)
+    if ALLOWED_GUILD_IDS and gid not in ALLOWED_GUILD_IDS:
+        log.warning(f"非白名单服务器尝试加入：{guild.name}（{gid}），已自动退出")
+        await guild.leave()
+        return
+    _guild_bootstrap(gid)
+    log.info(f"已加入白名单服务器：{guild.name}（{gid}）")
 
 @bot.event
 async def on_disconnect():
@@ -248,6 +270,12 @@ async def on_message(message: discord.Message):
     chan_id   = str(message.channel.id)
     user_id   = str(message.author.id)
     mentioned = bot.user in message.mentions
+    
+    # ── 白名单鉴权：非授权服务器静默丢弃 ────────────────────────────────────
+    # ALLOWED_GUILD_IDS 为空集合时表示不限制（个人调试场景）
+    if ALLOWED_GUILD_IDS and guild_id not in ALLOWED_GUILD_IDS:
+        log.debug(f"非白名单服务器 {guild_id}，已忽略")
+        return
 
     # 懒加载初始化（幂等，失败则静默跳过）
     if not _guild_bootstrap(guild_id):
