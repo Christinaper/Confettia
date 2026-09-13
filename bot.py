@@ -294,6 +294,14 @@ async def on_message(message: discord.Message):
         log.warning(f"Guild {guild_id} 初始化失败，跳过消息")
         return
 
+    # ── 白名单鉴权：非授权用户静默丢弃 ──────────────────────────────────────
+    # allowed_users 为空列表时不限制（trusted 服务器全员可用）
+    # 有值时只有列表内的 user_id 才能触发 LLM
+    allowed_users = _guild_get_config(guild_id).get("allowed_users", [])
+    if allowed_users and user_id not in allowed_users:
+        log.debug(f"非白名单用户 {user_id}，已忽略")
+        return
+
     role = get_channel_role(guild_id, chan_id)
 
     # ── 按频道角色路由 ────────────────────────────────────────────────────────
