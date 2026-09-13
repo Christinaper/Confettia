@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "daily_hour_utc":  1,
     "rag_enabled":     False,
     "initialized":     False,   # /setup 完成后改为 True
+    "allowed_users":   [],      # 空列表 = 不限制，有值则只允许列表内的 user_id
 }
 
 
