@@ -190,8 +190,20 @@ async def on_guild_join(guild: discord.Guild):
     gid = str(guild.id)
     if ALLOWED_GUILD_IDS and gid not in ALLOWED_GUILD_IDS:
         log.warning(f"非白名单服务器尝试加入：{guild.name}（{gid}），已自动退出")
-        await guild.leave()
+        await log_to_channel(
+            f"⚠️ **非白名单服务器尝试加入**\n"
+            f"服务器：{guild.name}（`{gid}`）\n"
+            f"已自动退出。如需允许，将此 ID 加入 `ALLOWED_GUILD_IDS`。"
+        )
+        try:
+            await guild.leave()
+        except discord.NotFound:
+            # 重复触发时 bot 已不在该服务器，忽略
+            log.debug(f"退出时服务器已不存在（重复触发）：{gid}")
+        except Exception as e:
+            log.error(f"退出非白名单服务器失败：{gid} — {e}")
         return
+    # 白名单内：初始化该服务器配置
     _guild_bootstrap(gid)
     log.info(f"已加入白名单服务器：{guild.name}（{gid}）")
 
