@@ -111,7 +111,9 @@ async def _call_deepseek(prompt: str, history: list, system_prompt: str) -> str:
 
     proxy_url = _get_proxy_url()
 
-    async with aiohttp.ClientSession() as s:
+    # trust_env=False：禁止 aiohttp 读取系统 http_proxy/https_proxy 环境变量
+    # 代理完全由 _get_proxy_url() 控制，PROXY= 置空时强制直连
+    async with aiohttp.ClientSession(trust_env=False) as s:
         async with s.post("https://api.deepseek.com/chat/completions",
                           headers=headers, json=payload,
                           timeout=aiohttp.ClientTimeout(total=30),

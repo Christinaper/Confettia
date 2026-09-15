@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
         {"name": "DeepSeek",
          "url":  "https://api.deepseek.com/rss.xml"},
     ],
-    "token_budget":    15000,
+    "token_budget":    50000,
     "daily_hour_utc":  1,
     "rag_enabled":     False,
     "initialized":     False,   # /setup 完成后改为 True

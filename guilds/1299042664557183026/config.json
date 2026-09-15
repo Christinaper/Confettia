@@ -26,8 +26,9 @@
       "url": "https://openai.com/blog/rss.xml"
     }
   ],
-  "token_budget": 15000,
+  "token_budget": 50000,
   "daily_hour_utc": 1,
   "rag_enabled": false,
-  "initialized": true
+  "initialized": true,
+  "allowed_users": ["1237415935187615766"]
 }

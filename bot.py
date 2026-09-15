@@ -8,6 +8,7 @@ import os
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from dotenv import load_dotenv
 from agent import run_agent, memory
@@ -242,8 +243,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # ── 健康检查 ──────────────────────────────────────────────────────────────────
+_token_warned = False  # 每日只发一次告警，重置随 token 计数器一起
+_token_warn_date = ""  # 记录告警是哪天发的
+
 @tasks.loop(minutes=10)
 async def health_check():
+    global _token_warned, _token_warn_date
     if len(_processing) > 10:
         log.warning(f"处理队列积压（{len(_processing)}），强制清空。")
         _processing.clear()
@@ -252,8 +257,14 @@ async def health_check():
         f"💓 健康检查｜Token：{usage['total']}/{usage['budget']} "
         f"({usage['pct']}%)｜调用：{usage['calls']}次｜队列：{len(_processing)}"
     )
-    # token 用量超过 70% 时推送到 log 频道
-    if usage["pct"] >= 70:
+    # 日期变了就重置告警标记
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _token_warn_date != today:
+        _token_warned = False
+        _token_warn_date = today
+    # token 用量超过 80% 时推送到 log 频道，每日只发一次
+    if usage["pct"] >= 80 and not _token_warned:
+        _token_warned = True
         await log_to_channel(
             f"⚠️ **Token 用量告警** {usage['pct']}%\n"
             f"`{usage['total']:,} / {usage['budget']:,}` tokens 已用\n"
