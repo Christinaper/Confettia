@@ -3,9 +3,11 @@
 # 支持动态 system_prompt 传入 (由 prompt_builder 组装)
 
 import os
+import json
 import logging
 import aiohttp
 from datetime import datetime, timezone
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -50,15 +52,44 @@ MAX_INPUT_CHARS    = _get_int_env("MAX_INPUT_LEN", 1500)
 
 log.info(f"LLM Provider: {ACTIVE_PROVIDER.upper()}")
 
-# ── 全局 token 计数器 (内存级, 重启归零 )────────────────────────────────────
-_token_usage = {"date": "", "input": 0, "output": 0, "calls": 0, "errors": 0}
+# _token_usage = {"date": "", "input": 0, "output": 0, "calls": 0, "errors": 0}
+# ── 全局 token 计数器（持久化到文件，重启不归零）─────────────────────────────
+_USAGE_FILE = Path("token_usage.json")
+
+def _load_usage() -> dict:
+    """启动时从文件读取当日用量，文件不存在或日期不符则返回空计数。"""
+    empty = {"date": "", "input": 0, "output": 0, "calls": 0, "errors": 0}
+    if not _USAGE_FILE.exists():
+        return empty
+    try:
+        data = json.loads(_USAGE_FILE.read_text(encoding="utf-8"))
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # 日期不同说明是昨天的数据，返回空（今天重新计数）
+        if data.get("date") != today:
+            return empty
+        return data
+    except Exception:
+        return empty
+
+def _save_usage() -> None:
+    """把当前计数写入文件。每次 _add_usage 后调用。"""
+    try:
+        _USAGE_FILE.write_text(
+            json.dumps(_token_usage, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        log.warning(f"token 用量持久化失败：{e}")
+
+_token_usage = _load_usage()  # 启动时读取，不是硬编码空字典
 
 def _reset_if_new_day():
-    """UTC 日期变更时重置计数器。"""
+    """UTC 日期变更时重置计数器并持久化。"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _token_usage["date"] != today:
         log.info(f"重置 token 计数。昨日: in={_token_usage['input']} out={_token_usage['output']}")
         _token_usage.update({"date": today, "input": 0, "output": 0, "calls": 0, "errors": 0})
+        _save_usage()
 
 def _total_today():
     return _token_usage["input"] + _token_usage["output"]
@@ -68,6 +99,7 @@ def _add_usage(inp: int, out: int):
     _token_usage["output"] += out
     _token_usage["calls"]  += 1
     log.info(f"Token: +{inp}in +{out}out | 今日 {_total_today()}/{DAILY_TOKEN_BUDGET}")
+    _save_usage()  # 每次调用后写盘，重启不丢数据
 
 def get_usage_summary() -> dict:
     """供 /status 命令调用, 返回当日用量摘要。"""
